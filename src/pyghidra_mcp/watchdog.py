@@ -67,12 +67,12 @@ class Watchdog:
 
     def _check_task_stalls(self) -> None:
         stats = self._executor.stats
-        current = stats.get("current_task")
-        elapsed = stats.get("current_task_elapsed", 0)
-        if current is not None and elapsed > self._task_stall_threshold:
+        busy_for = stats.get("busy_since", 0)
+        if busy_for > self._task_stall_threshold:
             logger.warning(
-                "Watchdog: task '%s' running for %.0fs (threshold=%.0fs) -- possible stall",
-                current, elapsed, self._task_stall_threshold,
+                "Watchdog: executor busy for %.0fs with %s active calls (threshold=%.0fs) -- "
+                "possible stall",
+                busy_for, stats.get("active_calls", 0), self._task_stall_threshold,
             )
 
     def _check_queue_depth(self) -> None:

@@ -51,8 +51,8 @@ class GhidraExecutor:
         self._task_timeout = task_timeout
         self._running = threading.Event()
         self._ready = threading.Event()
-        self._current_task_id: str | None = None
-        self._current_task_start: float | None = None
+        self._active_calls = 0
+        self._active_call_start: float | None = None
         self._tasks_completed = 0
         self._tasks_failed = 0
         self._lock = threading.Lock()
@@ -79,8 +79,9 @@ class GhidraExecutor:
                         self._queue.get(), timeout=0.5
                     )
                     with self._lock:
-                        self._current_task_id = task_id
-                        self._current_task_start = time.monotonic()
+                        self._active_calls += 1
+                        if self._active_call_start is None:
+                            self._active_call_start = time.monotonic()
                     try:
                         rw_lock = getattr(program_info, "rw_lock", None)
                         if rw_lock is not None:
@@ -94,8 +95,9 @@ class GhidraExecutor:
                         self._tasks_failed += 1
                     finally:
                         with self._lock:
-                            self._current_task_id = None
-                            self._current_task_start = None
+                            self._active_calls -= 1
+                            if self._active_calls == 0:
+                                self._active_call_start = None
                     try:
                         await asyncio.wait_for(result_queue.put(result), timeout=5.0)
                     except asyncio.TimeoutError:
@@ -186,20 +188,25 @@ class GhidraExecutor:
             self._thread.join(timeout=2.0)
 
     @property
+    def idle(self) -> bool:
+        with self._lock:
+            return self._active_calls == 0
+
+    @property
     def stats(self) -> dict:
         with self._lock:
-            current_id = self._current_task_id
-            current_start = self._current_task_start
+            active = self._active_calls
+            start = self._active_call_start
             completed = self._tasks_completed
             failed = self._tasks_failed
         queue_depth = self._queue.qsize() if self._queue else 0
         elapsed = 0.0
-        if current_start is not None:
-            elapsed = time.monotonic() - current_start
+        if start is not None:
+            elapsed = time.monotonic() - start
         return {
             "tasks_completed": completed,
             "tasks_failed": failed,
-            "current_task": current_id,
-            "current_task_elapsed": round(elapsed, 1),
+            "active_calls": active,
+            "busy_since": round(elapsed, 1),
             "queue_depth": queue_depth,
         }
