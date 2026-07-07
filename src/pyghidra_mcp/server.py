@@ -391,7 +391,7 @@ def run_mcp_server(mcp: FastMCP, transport: str) -> None:
 @optgroup.option(
     "--project-path",
     type=click.Path(path_type=Path),
-    default=Path("pyghidra_mcp_projects"),
+    default=Path("C:/Dev/Ghidra-MCP/ghidra-projects"),
     show_default=True,
     help="Directory path to create new pyghidra-mcp project or an existing Ghidra .gpr file.",
 )
