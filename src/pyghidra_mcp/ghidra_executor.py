@@ -130,7 +130,7 @@ class GhidraExecutor:
 
         future = asyncio.run_coroutine_threadsafe(_execute(), self._loop)
         await self._queue.put((task_id or "unknown", future))
-        return await future
+        return await asyncio.wrap_future(future)
 
     async def submit_nowait(
         self,
