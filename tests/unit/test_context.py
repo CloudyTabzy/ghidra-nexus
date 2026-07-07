@@ -69,8 +69,18 @@ def test_list_program_infos_returns_loaded_programs():
 
 def test_get_program_info_schedules_indexing_for_ready_binary():
     context = PyGhidraContext.__new__(PyGhidraContext)
+    # ProgramInfo now has separate ``analysis_complete`` (mirror property)
+    # and ``ghidra_analysis_complete`` (raw flag) plus a ``dead`` flag; the
+    # production guard in ``get_program_info`` checks both, so we have to
+    # populate them explicitly. A bare Mock auto-returns truthy Mock objects
+    # for unspecified attributes, which makes the dead-branch fire.
     program_info = Mock()
+    program_info.name = "/bin/sample"
     program_info.analysis_complete = True
+    program_info.ghidra_analysis_complete = True
+    program_info.dead = False
+    program_info.code_collection = None
+    program_info.strings = None
     context.programs = {"/bin/sample": program_info}
     context.schedule_indexing = Mock()
 

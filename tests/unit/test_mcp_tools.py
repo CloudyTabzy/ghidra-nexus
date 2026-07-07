@@ -17,7 +17,33 @@ from pyghidra_mcp.mcp_tools import (
 from pyghidra_mcp.models import ProgramInfo, SymbolInfo
 
 
-def test_list_project_binaries_uses_project_wide_context_listing():
+def _executor_mock():
+    """Build a mock GhidraExecutor whose submit just runs the callable.
+
+    The new async-handler pipeline (post concurrency-safety refactor) calls
+    ``get_executor().submit(...)`` for every real handler. Tests want to
+    bypass that and just run the closure synchronously, so we return a mock
+    whose ``submit`` invokes ``fn()`` and returns the result.
+    """
+    executor = Mock()
+
+    async def _submit(_program_info, fn, **_kwargs):
+        return fn()
+
+    executor.submit = _submit
+    return executor
+
+
+def _patch_executor(monkeypatch, executor=None):
+    """Install an executor mock for handlers that go through ``get_executor``."""
+    monkeypatch.setattr(
+        "pyghidra_mcp.mcp_tools.get_executor",
+        lambda: executor if executor is not None else _executor_mock(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_project_binaries_uses_project_wide_context_listing():
     program_info = ProgramInfo(
         name="/folder/sample",
         file_path=None,
@@ -36,12 +62,13 @@ def test_list_project_binaries_uses_project_wide_context_listing():
     ctx = Mock()
     ctx.request_context.lifespan_context = pyghidra_context
 
-    response = list_project_binaries(ctx)
+    response = await list_project_binaries(ctx)
 
     assert response.programs == [program_info]
 
 
-def test_set_comment_uses_tool_path(monkeypatch):
+@pytest.mark.asyncio
+async def test_set_comment_uses_tool_path(monkeypatch):
     pyghidra_context = Mock()
     pyghidra_context.get_program_info.return_value = Mock()
 
@@ -56,8 +83,9 @@ def test_set_comment_uses_tool_path(monkeypatch):
     ctx.request_context.lifespan_context = pyghidra_context
 
     monkeypatch.setattr("pyghidra_mcp.mcp_tools.GhidraTools", lambda _program_info: fake_tools)
+    _patch_executor(monkeypatch)
 
-    response = set_comment(
+    response = await set_comment(
         binary_name="sample",
         target="entry",
         comment="function summary",
@@ -71,7 +99,8 @@ def test_set_comment_uses_tool_path(monkeypatch):
     assert response.comment_type == "decompiler"
 
 
-def test_rename_variable_uses_tool_path(monkeypatch):
+@pytest.mark.asyncio
+async def test_rename_variable_uses_tool_path(monkeypatch):
     pyghidra_context = Mock()
     pyghidra_context.get_program_info.return_value = Mock()
 
@@ -88,8 +117,9 @@ def test_rename_variable_uses_tool_path(monkeypatch):
     ctx.request_context.lifespan_context = pyghidra_context
 
     monkeypatch.setattr("pyghidra_mcp.mcp_tools.GhidraTools", lambda _program_info: fake_tools)
+    _patch_executor(monkeypatch)
 
-    response = rename_variable(
+    response = await rename_variable(
         binary_name="sample",
         function_name_or_address="helper",
         variable_name="count",
@@ -106,7 +136,8 @@ def test_rename_variable_uses_tool_path(monkeypatch):
     assert response.new_name == "item_count"
 
 
-def test_set_variable_type_uses_tool_path(monkeypatch):
+@pytest.mark.asyncio
+async def test_set_variable_type_uses_tool_path(monkeypatch):
     pyghidra_context = Mock()
     pyghidra_context.get_program_info.return_value = Mock()
 
@@ -124,8 +155,9 @@ def test_set_variable_type_uses_tool_path(monkeypatch):
     ctx.request_context.lifespan_context = pyghidra_context
 
     monkeypatch.setattr("pyghidra_mcp.mcp_tools.GhidraTools", lambda _program_info: fake_tools)
+    _patch_executor(monkeypatch)
 
-    response = set_variable_type(
+    response = await set_variable_type(
         binary_name="sample",
         function_name_or_address="helper",
         variable_name="total",
@@ -143,7 +175,8 @@ def test_set_variable_type_uses_tool_path(monkeypatch):
     assert response.new_type == "long"
 
 
-def test_set_function_prototype_uses_tool_path(monkeypatch):
+@pytest.mark.asyncio
+async def test_set_function_prototype_uses_tool_path(monkeypatch):
     pyghidra_context = Mock()
     pyghidra_context.get_program_info.return_value = Mock()
 
@@ -159,8 +192,9 @@ def test_set_function_prototype_uses_tool_path(monkeypatch):
     ctx.request_context.lifespan_context = pyghidra_context
 
     monkeypatch.setattr("pyghidra_mcp.mcp_tools.GhidraTools", lambda _program_info: fake_tools)
+    _patch_executor(monkeypatch)
 
-    response = set_function_prototype(
+    response = await set_function_prototype(
         binary_name="sample",
         function_name_or_address="function_one",
         prototype="long function_one(long count)",
@@ -193,11 +227,7 @@ async def test_decompile_function_offloads_with_timeout(monkeypatch):
     ctx.request_context.lifespan_context = pyghidra_context
 
     monkeypatch.setattr("pyghidra_mcp.mcp_tools.GhidraTools", lambda _program_info: fake_tools)
-
-    async def fake_to_thread(fn, *args, **kwargs):
-        return fn(*args, **kwargs)
-
-    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
+    _patch_executor(monkeypatch)
 
     response = await decompile_function(
         binary_name="sample",
@@ -232,18 +262,39 @@ async def test_decompile_does_not_block_other_tool_calls(monkeypatch):
 
     ctx = Mock()
     ctx.request_context.lifespan_context = pyghidra_context
-
     monkeypatch.setattr("pyghidra_mcp.mcp_tools.GhidraTools", lambda _program_info: fake_tools)
 
+    # Use a controllable executor whose submit blocks until we release it;
+    # while the decompile is in flight the symbols call should still be
+    # able to complete, proving the executor funnel does not block.
     decompile_started = asyncio.Event()
     release_decompile = asyncio.Event()
+    in_progress = {"search": False}
 
-    async def fake_to_thread(fn, *args, **kwargs):
-        decompile_started.set()
-        await release_decompile.wait()
-        return fn(*args, **kwargs)
+    blocked_submit = Mock()
 
-    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
+    async def _blocked_submit(_program_info, fn, **_kwargs):
+        if "decompile" in (_kwargs.get("task_id") or ""):
+            decompile_started.set()
+            await release_decompile.wait()
+            return fn()
+        # Symbols (and anything else) is unrelated — just run.
+        in_progress["search"] = True
+        try:
+            return fn()
+        finally:
+            in_progress["search"] = False
+
+    blocked_submit.side_effect = lambda *a, **kw: _blocked_submit(*a, **kw)
+    # The above side_effect won't actually be awaited via Mock(side_effect=fn);
+    # rebuild as a coroutine-returning mock.
+    blocked_executor = Mock()
+
+    async def _submit(program_info, fn, **kwargs):
+        return await _blocked_submit(program_info, fn, **kwargs)
+
+    blocked_executor.submit = _submit
+    monkeypatch.setattr("pyghidra_mcp.mcp_tools.get_executor", lambda: blocked_executor)
 
     fake_tools.decompile_function_by_name_or_addr.return_value = decompiled
 
@@ -258,7 +309,7 @@ async def test_decompile_does_not_block_other_tool_calls(monkeypatch):
 
     await decompile_started.wait()
 
-    symbols = search_symbols_by_name(
+    symbols = await search_symbols_by_name(
         binary_name="sample",
         query="entry",
         ctx=ctx,
@@ -275,7 +326,8 @@ async def test_decompile_does_not_block_other_tool_calls(monkeypatch):
     assert response == [decompiled]
 
 
-def test_goto_uses_gui_context():
+@pytest.mark.asyncio
+async def test_goto_uses_gui_context():
     gui_context = GuiPyGhidraContext.__new__(GuiPyGhidraContext)
     gui_context.goto = Mock()
     gui_context.goto.return_value = {
@@ -287,7 +339,7 @@ def test_goto_uses_gui_context():
     ctx = Mock()
     ctx.request_context.lifespan_context = gui_context
 
-    response = goto(
+    response = await goto(
         binary_name="sample",
         target="entry",
         target_type="function",
