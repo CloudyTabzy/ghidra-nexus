@@ -173,6 +173,9 @@ def main() -> None:
     stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
 
+    sys.stderr.write(f"pyghidra-mcp proxy: started on port {DAEMON_PORT}, pid={os.getpid()}\n")
+    sys.stderr.flush()
+
     signal.signal(signal.SIGINT, lambda *_: _cleanup() or sys.exit(0))
     signal.signal(signal.SIGTERM, lambda *_: _cleanup() or sys.exit(0))
 
@@ -188,17 +191,21 @@ def main() -> None:
             try:
                 request = json.loads(line)
             except json.JSONDecodeError:
+                sys.stderr.write(f"proxy: bad JSON: {line[:120]}\n")
+                sys.stderr.flush()
                 continue
 
             method = request.get("method", "")
             req_id = request.get("id")
+            sys.stderr.write(f"proxy: <- {method} (id={req_id})\n")
+            sys.stderr.flush()
 
             if method == "ping":
-                stdout.write(
-                    json.dumps({"jsonrpc": "2.0", "id": req_id, "result": {}}).encode("utf-8")
-                    + b"\n"
-                )
+                resp = {"jsonrpc": "2.0", "id": req_id, "result": {}}
+                stdout.write(json.dumps(resp).encode("utf-8") + b"\n")
                 stdout.flush()
+                sys.stderr.write(f"proxy: -> ping ok\n")
+                sys.stderr.flush()
                 continue
 
             if not _DAEMON_READY.is_set() and method not in ("initialize",):
@@ -237,6 +244,8 @@ def main() -> None:
                 }
                 stdout.write(json.dumps(response).encode("utf-8") + b"\n")
                 stdout.flush()
+                sys.stderr.write("proxy: -> initialize ok (daemon launching in bg)\n")
+                sys.stderr.flush()
                 continue
 
             if method == "notifications/initialized":
@@ -246,6 +255,8 @@ def main() -> None:
             if response is not None:
                 stdout.write(json.dumps(response, default=str).encode("utf-8") + b"\n")
                 stdout.flush()
+                sys.stderr.write(f"proxy: -> forwarded {method} (id={req_id})\n")
+                sys.stderr.flush()
 
         except (BrokenPipeError, KeyboardInterrupt):
             break
