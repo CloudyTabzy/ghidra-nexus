@@ -209,6 +209,8 @@ __marimo__/
 
 pyghidra_mcp_projects/** 
 tests/pyghidra_mcp_projects/**
+src/pyghidra_mcp_projects/
+chroma_test/
 
 # Personal
 ghidra
