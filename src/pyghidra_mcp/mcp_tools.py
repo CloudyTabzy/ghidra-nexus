@@ -607,15 +607,121 @@ async def survey_binary(
     ctx: Context,
     detail_level: Literal["standard", "minimal"] = "standard",
 ) -> SurveyBinaryResult:
-    """Single-call binary triage snapshot.
+    """Single-call binary triage snapshot — alias for ``survey_binary_full``.
 
-    Returns file metadata, segment layout, entry points, statistics, top 15
-    strings/functions ranked by xref count (functions include a ``type`` field:
-    thunk/wrapper/leaf/dispatcher/complex), imports grouped by category, and a
-    call-graph summary. Use this as your FIRST tool call when starting
-    analysis. Pass ``detail_level='minimal'`` for binaries with more than
-    ~10k functions. Refuses to run while Ghidra analysis is in progress —
-    call ``analysis_status`` first to check.
+    Kept for backward compatibility. Prefer ``survey_binary_fast`` for a
+    pre-analysis snapshot in milliseconds, and ``survey_binary_full`` when
+    you can wait for the full Ghidra auto-analysis. Refuses to run while
+    Ghidra analysis is in progress — call ``analysis_status`` first to
+    check.
+    """
+    return await survey_binary_full(
+        binary_name=binary_name, ctx=ctx, detail_level=detail_level
+    )
+
+
+@mcp_error_handler
+async def survey_binary_fast(
+    binary_name: str,
+    ctx: Context,
+) -> SurveyBinaryResult:
+    """Pre-analysis triage snapshot — returns in milliseconds.
+
+    **Use this for first-look triage of a freshly imported binary.**
+    Returns immediately with the data Ghidra has after raw import (no
+    auto-analysis, no PDB download, no Decompiler analyzers running).
+    Typical latency: **< 1 second**.
+
+    The result's ``mode`` field is ``"fast"`` and the ``note`` field is
+    set to ``"pre-analysis: ..."`` so subsequent agents can tell at a
+    glance that the data is pre-analysis.
+
+    What you get:
+        - ``metadata``: arch, image base, size, md5/sha256
+        - ``statistics``: function/string/segment counts (function count is
+          typically just the entry point + imports before analysis)
+        - ``segments``: memory blocks with rwx perms
+        - ``entrypoints``: external entry points (exports)
+        - ``imports_by_category``: full bin of all imports by capability
+          (crypto / network / file_io / process / registry / other)
+        - ``interesting_functions``: top-15 by **body size** (NOT xrefs —
+          xrefs aren't computed yet). ``callee_count`` and ``xref_count``
+          are reported as 0.
+        - ``interesting_strings``: length-sorted slice of defined strings
+          (capped at 50). NOT xref-ranked.
+        - ``call_graph_summary``: present but all counters are 0 (call
+          graph isn't computed until analyzers run)
+
+    Use ``survey_binary_full`` afterwards if you want xref-ranked results
+    and the call-graph topology. Or go straight to ``decompile_function``
+    on a function from ``interesting_functions`` if you've already
+    identified a target.
+
+    Unlike ``survey_binary_full``, this tool does NOT wait for
+    ``analysis_status()`` to report complete — it works on whatever
+    state the program is in, including a freshly imported binary that
+    hasn't been analyzed yet.
+    """
+    pyghidra_context = _get_context(ctx)
+    program_info = pyghidra_context.get_program_info(binary_name)
+    tools = GhidraTools(program_info)
+
+    def _run():
+        return tools.survey_binary_fast()
+
+    return await get_executor().submit(
+        program_info,
+        _run,
+        task_id=f"survey_fast:{binary_name}",
+    )
+
+
+@mcp_error_handler
+async def survey_binary_full(
+    binary_name: str,
+    ctx: Context,
+    detail_level: Literal["standard", "minimal"] = "standard",
+) -> SurveyBinaryResult:
+    """Post-analysis triage snapshot — waits for full Ghidra analysis.
+
+    **Use this for deep triage of a binary you've decided is worth
+    analyzing.** Returns everything the survey can give you: file
+    metadata, segment layout, entry points, statistics, top-15 strings
+    ranked by xref count, top-15 functions ranked by xref count (each
+    classified as ``thunk`` / ``wrapper`` / ``leaf`` / ``dispatcher`` /
+    ``complex``), imports grouped by category, and a call-graph
+    summary with max-depth BFS estimate.
+
+    The result's ``mode`` field is ``"full"``.
+
+    **Refuses to run while Ghidra auto-analysis is still in progress.**
+    On a freshly imported binary that takes 5-10 minutes to analyze
+    (PDB download + Decompiler analyzers), use ``survey_binary_fast``
+    first to get a quick read, and call this tool once
+    ``analysis_status()`` reports complete.
+
+    Parameters
+    ----------
+    binary_name
+        The project program name (use ``list_project_binaries`` to find
+        it). May be a unique prefix.
+    detail_level
+        ``"standard"`` returns the full payload above.
+        ``"minimal"`` returns only metadata, statistics, segments, and
+        entrypoints — use for very large binaries where the full payload
+        would block the executor thread.
+
+    Subsequent follow-ups (from ``recommended_tools``):
+        - ``interesting_functions`` → ``decompile_function`` on the top
+          dispatcher / complex function, then ``gen_callgraph`` from
+          there.
+        - ``interesting_strings`` → ``list_xrefs`` on a suspicious
+          string address, then ``decompile_function`` on each caller.
+        - ``imports_by_category`` → ``decompile_function`` on every
+          caller of a flagged import (``CreateRemoteThread``,
+          ``VirtualProtect``, etc.).
+        - ``call_graph_summary`` → ``gen_callgraph(binary_name, "entry",
+          direction="called")`` for the topology.
     """
     pyghidra_context = _get_context(ctx)
     program_info = pyghidra_context.get_program_info(binary_name)
@@ -627,18 +733,20 @@ async def survey_binary(
                 code=INVALID_PARAMS,
                 message=(
                     f"Ghidra analysis for '{binary_name}' is still in progress. "
-                    "Wait for analysis_status to report complete, then retry."
+                    "Call survey_binary_fast for a pre-analysis snapshot, or "
+                    "wait for analysis_status to report complete and then "
+                    "retry survey_binary_full."
                 ),
             )
         )
 
     def _run():
-        return tools.survey_binary(detail_level=detail_level)
+        return tools.survey_binary_full(detail_level=detail_level)
 
     return await get_executor().submit(
         program_info,
         _run,
-        task_id=f"survey:{binary_name}:{detail_level}",
+        task_id=f"survey_full:{binary_name}:{detail_level}",
     )
 
 

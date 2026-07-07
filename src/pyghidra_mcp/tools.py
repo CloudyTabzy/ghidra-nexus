@@ -390,15 +390,65 @@ class GhidraTools:
 
     @handle_exceptions
     def survey_binary(self, detail_level: str = "standard") -> SurveyBinaryResult:
-        """Single-call binary triage snapshot.
+        """Single-call binary triage snapshot — alias for :meth:`survey_binary_full`.
+
+        Kept for backward compatibility. Prefer :meth:`survey_binary_fast` when
+        you need a quick triage in milliseconds (pre-analysis) and
+        :meth:`survey_binary_full` when you can wait for the complete
+        Ghidra auto-analysis.
+        """
+        return self.survey_binary_full(detail_level=detail_level)
+
+    @handle_exceptions
+    def survey_binary_fast(self) -> SurveyBinaryResult:
+        """Pre-analysis triage snapshot — returns in milliseconds.
+
+        Use this for quick first-look triage without waiting for Ghidra's
+        full auto-analysis (which can take 5-10 minutes on a fresh binary
+        due to PDB download + Decompiler analyzers).
 
         Returns file metadata, segment layout, entry points, statistics,
-        top 15 strings/functions ranked by xref count (functions include
-        a ``type`` field: thunk/wrapper/leaf/dispatcher/complex), imports
-        grouped by category, and a call-graph summary. Use this as your
-        FIRST tool call when starting analysis. Pass
-        ``detail_level='minimal'`` for binaries with more than ~10k
-        functions.
+        imports grouped by category, top functions ranked by *body size*
+        (NOT xrefs — xrefs are not computed yet), and a length-sorted
+        slice of defined strings. The result's ``mode`` field is
+        ``"fast"`` and the ``note`` field is set to
+        ``"pre-analysis: ..."`` so the agent can tell at a glance.
+
+        This tool does NOT wait for ``analysis_status()`` to report
+        complete. It is the right choice when an agent just imported a
+        binary and wants to know "is this interesting enough to decompile?"
+        before committing to a 5-10 minute analysis wait.
+        """
+        from pyghidra_mcp import api_survey
+
+        raw = api_survey.survey_binary_fast(self.program)
+        return SurveyBinaryResult.model_validate(raw)
+
+    @handle_exceptions
+    def survey_binary_full(
+        self, detail_level: str = "standard"
+    ) -> SurveyBinaryResult:
+        """Post-analysis triage snapshot — waits for full Ghidra analysis.
+
+        Returns file metadata, segment layout, entry points, statistics,
+        top 15 strings ranked by xref count, top 15 functions ranked by
+        xref count (each classified as ``thunk`` / ``wrapper`` / ``leaf`` /
+        ``dispatcher`` / ``complex``), imports grouped by category, and a
+        call-graph summary with max-depth BFS estimate.
+
+        The result's ``mode`` field is ``"full"``.
+
+        This tool refuses to run while Ghidra auto-analysis is still in
+        progress — call :func:`analysis_status` first to check, or use
+        :meth:`survey_binary_fast` to get a pre-analysis snapshot instead.
+
+        Parameters
+        ----------
+        detail_level
+            ``"standard"`` returns the full payload above. ``"minimal"``
+            returns only metadata, statistics, segments, and entrypoints
+            — use for very large binaries where the full payload would
+            block the executor thread.
         """
         from pyghidra_mcp import api_survey
 

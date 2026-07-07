@@ -11,6 +11,7 @@ import time
 import pytest
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client
+from mcp.shared.exceptions import McpError
 
 from pyghidra_mcp.context import PyGhidraContext
 from pyghidra_mcp.models import SurveyBinaryResult
@@ -175,8 +176,83 @@ async def test_survey_binary_refuses_unknown_binary(server_params):
             await session.initialize()
 
             # Server is up but the binary is not imported.
-            with pytest.raises(Exception):
+            with pytest.raises((McpError, ValueError, RuntimeError)):
                 await session.call_tool(
                     "survey_binary",
                     {"binary_name": "definitely_not_a_real_binary_xyz", "detail_level": "standard"},
                 )
+
+
+@pytest.mark.asyncio
+async def test_survey_binary_fast_returns_immediately_pre_analysis(server_params):
+    """survey_binary_fast should work BEFORE Ghidra analysis completes.
+
+    This is the headline benefit of the fast variant: agents get a
+    useful triage in milliseconds without waiting for the 5-10 minute
+    Ghidra analysis. We import the binary, call survey_binary_fast
+    immediately (before the analysis-complete poll), and verify we got
+    a real payload with mode='fast'.
+    """
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+
+            binary_path = server_params.args[-1]
+            binary_name = PyGhidraContext._gen_unique_bin_name(binary_path)
+
+            # Import only — do NOT wait for analysis.
+            response = await session.call_tool(
+                "import_binary", {"binary_path": binary_path}
+            )
+            imp = json.loads(response.content[0].text)
+            assert imp["queued_count"] == 1
+
+            # survey_binary_fast should return immediately, regardless of
+            # whether the import has even appeared in project listing yet.
+            response = await session.call_tool(
+                "survey_binary_fast", {"binary_name": binary_name}
+            )
+            result = SurveyBinaryResult.model_validate_json(response.content[0].text)
+
+            # mode must be 'fast' and the result must carry a pre-analysis
+            # note so the agent can tell what it's looking at.
+            assert result.mode == "fast"
+            assert result.note is not None
+            assert "pre-analysis" in result.note.lower()
+
+
+@pytest.mark.asyncio
+async def test_survey_binary_full_alias_matches_survey_binary(server_params):
+    """The legacy survey_binary tool and survey_binary_full return the same shape."""
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+
+            binary_path = server_params.args[-1]
+            binary_name = PyGhidraContext._gen_unique_bin_name(binary_path)
+            _wait_for_binary_ready(session, binary_name)
+
+            # Call BOTH the legacy alias and the new full variant; results
+            # must agree on the structural fields we care about.
+            legacy = SurveyBinaryResult.model_validate_json(
+                (
+                    await session.call_tool(
+                        "survey_binary",
+                        {"binary_name": binary_name, "detail_level": "standard"},
+                    )
+                ).content[0].text
+            )
+            full = SurveyBinaryResult.model_validate_json(
+                (
+                    await session.call_tool(
+                        "survey_binary_full",
+                        {"binary_name": binary_name, "detail_level": "standard"},
+                    )
+                ).content[0].text
+            )
+
+            assert legacy.mode == "full"
+            assert full.mode == "full"
+            assert legacy.metadata.path == full.metadata.path
+            assert legacy.statistics.total_functions == full.statistics.total_functions
+            assert len(legacy.segments) == len(full.segments)

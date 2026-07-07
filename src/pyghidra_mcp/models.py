@@ -351,6 +351,16 @@ class SurveyBinaryResult(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     ok: bool
+    mode: str = Field(
+        "full",
+        description=(
+            "Which survey path produced this result: 'fast' (pre-analysis, "
+            "returned in milliseconds from raw-import data) or 'full' (post "
+            "Ghidra auto-analysis, with xref-ranked top-15s, classified "
+            "functions, and call-graph topology). Helps the agent know "
+            "whether the numbers can be trusted for triage."
+        ),
+    )
     metadata: SurveyMetadata
     statistics: SurveyStatistics
     segments: list[SurveySegmentInfo]

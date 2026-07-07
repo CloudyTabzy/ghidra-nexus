@@ -76,6 +76,8 @@ def register_common_tools(server: FastMCP) -> None:
     server.tool()(mcp_tools.analysis_status)
     server.tool()(mcp_tools.import_binary)
     server.tool()(mcp_tools.survey_binary)
+    server.tool()(mcp_tools.survey_binary_fast)
+    server.tool()(mcp_tools.survey_binary_full)
 
 
 def register_gui_tools(server: FastMCP) -> None:

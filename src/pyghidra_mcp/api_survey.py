@@ -748,6 +748,179 @@ def _recommended_tools() -> SurveyRecommendedTools:
     )
 
 
+def _build_largest_functions(
+    program, all_funcs: list, max_n: int = 15
+) -> list[SurveyInterestingFunction]:
+    """Size-ranked "interesting" functions, used by the pre-analysis fast path.
+
+    The full ``_build_interesting_functions`` ranks by incoming xref count,
+    but xrefs are not computed until Ghidra's reference analyzer has run.
+    For the fast survey we rank by function body size instead — large
+    functions are interesting even without their call relationships.
+    """
+    candidates: list[tuple[int, object, str, int, int]] = []
+    for func in all_funcs:
+        if func is None or not _is_user_defined_function(func):
+            continue
+        try:
+            name = func.getName() or ""
+        except Exception:
+            name = ""
+        try:
+            body = func.getBody()
+        except Exception:
+            body = None
+        size = int(body.getNumAddresses()) if body is not None else 0
+        # ``xref_count`` slot is 0 in the fast path — we haven't run the
+        # reference analyzer yet.
+        candidates.append((size, func, name, size, 0))
+
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    top = candidates[:max_n]
+
+    out: list[SurveyInterestingFunction] = []
+    for _size, func, name, body_size, _xref in top:
+        try:
+            entry = func.getEntryPoint()
+        except Exception:
+            continue
+        try:
+            addr = str(entry)
+        except Exception:
+            addr = "0x0"
+        # Best-effort classification — most fields need xrefs to be accurate.
+        classification = _classify_func(func, callee_count=0, size=body_size)
+        out.append(
+            SurveyInterestingFunction(
+                addr=addr,
+                name=name,
+                size=body_size,
+                xref_count=0,  # not computed in the fast path
+                callee_count=0,  # not computed in the fast path
+                type=classification,
+            )
+        )
+    return out
+
+
+def survey_binary_fast(program) -> dict:
+    """Pre-analysis triage snapshot — returns in milliseconds.
+
+    This is the *fast* survey path: it reads only the data Ghidra has after
+    raw import (no auto-analysis, no PDB download, no decompiler analyzers
+    running). Returns immediately with:
+
+    - ``metadata``: arch, image base, size, hashes
+    - ``statistics``: function/string/segment counts (best-effort — only
+      functions the loader identified at import time are counted)
+    - ``segments``: memory blocks with rwx perms
+    - ``entrypoints``: external entry points (exports)
+    - ``imports_by_category``: full bin of all imports (works pre-analysis)
+    - ``interesting_functions``: top-15 by *function size* (NOT by xref —
+      xrefs aren't computed yet). callee_count and xref_count are reported
+      as 0.
+    - ``interesting_strings``: defined strings WITHOUT xref ranking — sorted
+      alphabetically, capped to top-50 to avoid huge payloads
+    - ``call_graph_summary``: present but all counters are 0 (call graph
+      isn't computed until analyzers run)
+
+    Returns a ``SurveyBinaryResult``-shaped dict with ``note`` set to
+    ``"pre-analysis"`` so the agent can tell at a glance that the data is
+    raw-import only. Use ``survey_binary_full`` to wait for the full
+    Ghidra analysis and get xref-ranked / classified results.
+    """
+    fm = program.getFunctionManager()
+    try:
+        all_funcs = list(fm.getFunctions(True))
+    except Exception:
+        all_funcs = []
+
+    try:
+        from ghidra.program.util import DefinedStringIterator
+
+        try:
+            it = DefinedStringIterator.forProgram(program)
+        except Exception:
+            it = DefinedStringIterator.definedStrings(program)
+        all_strings = []
+        for data in it:
+            try:
+                all_strings.append((str(data.getValue()), str(data.getAddress())))
+            except Exception:
+                continue
+        string_count = len(all_strings)
+    except Exception:
+        all_strings = []
+        string_count = 0
+
+    segments = _build_segments(program)
+    metadata = _build_metadata(program)
+    entrypoints = _build_entrypoints(program)
+    statistics = _build_statistics(all_funcs, string_count, len(segments))
+
+    # Strings: no xrefs available, just sort by length and take a useful
+    # subset. Filter out garbage < 4 chars.
+    fast_strings: list[SurveyInterestingString] = []
+    for s, addr in all_strings:
+        if not s or len(s) < 4:
+            continue
+        fast_strings.append(
+            SurveyInterestingString(addr=addr, string=s, xref_count=0)
+        )
+    # Keep only the longest 50 — strings are flat-sorted; alphabetical
+    # would be a useless default.
+    fast_strings.sort(key=lambda x: len(x.string), reverse=True)
+    fast_strings = fast_strings[:50]
+
+    result: dict = {
+        "ok": True,
+        "mode": "fast",
+        "metadata": metadata,
+        "statistics": statistics,
+        "segments": segments,
+        "entrypoints": entrypoints,
+        "interesting_functions": _build_largest_functions(program, all_funcs),
+        "interesting_strings": fast_strings,
+        "imports_by_category": _build_imports_by_category(program),
+        "call_graph_summary": SurveyCallGraphSummary(
+            total_edges=0,
+            max_depth_estimate=None,
+            root_functions=[],
+            leaf_functions_count=0,
+        ).model_dump(),
+        "recommended_tools": SurveyRecommendedTools(
+            interesting_functions=(
+                "PRE-ANALYSIS: function ranks are by body size, not by xref "
+                "count (xrefs aren't computed yet). Use survey_binary_full for "
+                "xref-ranked top-15."
+            ),
+            interesting_strings=(
+                "PRE-ANALYSIS: strings are sorted by length, not by xref count. "
+                "Use survey_binary_full for xref-ranked top-15."
+            ),
+            call_graph_summary=(
+                "PRE-ANALYSIS: call graph is empty until Ghidra's reference "
+                "analyzer runs. Use survey_binary_full for the topology."
+            ),
+            imports_by_category=(
+                "Use list_xrefs on a suspicious import address to find every "
+                "caller once analysis has completed."
+            ),
+            overall=(
+                "This is the FAST survey — pre-analysis data only. Call "
+                "survey_binary_full for a deep triage, or use decompile_function "
+                "directly on a function from `interesting_functions` (size-ranked)."
+            ),
+        ).model_dump(),
+        "note": (
+            "pre-analysis: Ghidra auto-analysis has not run yet. Call "
+            "survey_binary_full for xref-ranked functions, classified "
+            "function types, and call-graph topology."
+        ),
+    }
+    return result
+
+
 def survey_binary(program, *, detail_level: str = "standard") -> dict:
     """Build a single-call triage snapshot of ``program``.
 
@@ -798,6 +971,7 @@ def survey_binary(program, *, detail_level: str = "standard") -> dict:
 
     result: dict = {
         "ok": True,
+        "mode": "full",
         "metadata": metadata,
         "statistics": statistics,
         "segments": segments,
