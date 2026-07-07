@@ -63,32 +63,39 @@ class GhidraExecutor:
     async def _worker_loop(self) -> None:
         self._queue = asyncio.Queue(maxsize=self._max_queue_size)
         self._ready.set()
-        while self._running.is_set():
-            try:
-                task_id, coro = await asyncio.wait_for(self._queue.get(), timeout=0.5)
-                with self._lock:
-                    self._current_task_id = task_id
-                    self._current_task_start = time.monotonic()
+        worker_task: asyncio.Task | None = None
+        try:
+            while self._running.is_set():
                 try:
-                    await asyncio.wait_for(coro, timeout=self._task_timeout)
-                    self._tasks_completed += 1
-                except asyncio.TimeoutError:
-                    self._tasks_failed += 1
-                    raise RuntimeError(
-                        f"Task '{task_id}' timed out after {self._task_timeout}s. "
-                        f"Consider reducing concurrent agent load or increasing timeout."
-                    )
-                except Exception:
-                    self._tasks_failed += 1
-                    raise
-                finally:
+                    task_id, coro = await asyncio.wait_for(self._queue.get(), timeout=0.5)
                     with self._lock:
-                        self._current_task_id = None
-                        self._current_task_start = None
-            except asyncio.TimeoutError:
-                pass
-            except asyncio.CancelledError:
-                break
+                        self._current_task_id = task_id
+                        self._current_task_start = time.monotonic()
+                    try:
+                        worker_task = asyncio.ensure_future(coro)
+                        await asyncio.wait_for(worker_task, timeout=self._task_timeout)
+                        self._tasks_completed += 1
+                    except asyncio.TimeoutError:
+                        self._tasks_failed += 1
+                        raise RuntimeError(
+                            f"Task '{task_id}' timed out after {self._task_timeout}s. "
+                            f"Consider reducing concurrent agent load or increasing timeout."
+                        )
+                    except Exception:
+                        self._tasks_failed += 1
+                        raise
+                    finally:
+                        worker_task = None
+                        with self._lock:
+                            self._current_task_id = None
+                            self._current_task_start = None
+                except asyncio.TimeoutError:
+                    pass
+                except asyncio.CancelledError:
+                    break
+        finally:
+            if worker_task is not None and not worker_task.done():
+                worker_task.cancel()
 
     async def submit(
         self,
@@ -154,12 +161,14 @@ class GhidraExecutor:
     def shutdown(self, timeout: float = 10.0) -> None:
         self._running.clear()
         if self._loop is not None:
-            try:
-                self._loop.call_soon_threadsafe(self._loop.stop)
-            except Exception:
-                pass
-        if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=timeout)
+            if self._thread is not None and self._thread.is_alive():
+                self._thread.join(timeout=timeout)
+            if self._thread is not None and self._thread.is_alive():
+                try:
+                    self._loop.call_soon_threadsafe(self._loop.stop)
+                except Exception:
+                    pass
+                self._thread.join(timeout=2.0)
 
     @property
     def stats(self) -> dict:
