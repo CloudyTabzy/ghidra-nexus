@@ -20,6 +20,7 @@ from pyghidra_mcp.context_protocol import MCPContext
 from pyghidra_mcp.ghidra_executor import GhidraExecutor, set_executor
 from pyghidra_mcp.gui_context import GuiPyGhidraContext
 from pyghidra_mcp.gui_launcher import GuiPyGhidraMcpLauncher, ensure_macos_framework_python
+from pyghidra_mcp.lazy_context import LazyPyGhidraContext
 from pyghidra_mcp.project_spec import DEFAULT_PROJECT_NAME, ProjectSpec
 from pyghidra_mcp.watchdog import Watchdog, set_watchdog
 
@@ -183,9 +184,15 @@ def init_pyghidra_context(  # noqa: C901
         logger.warning("No binaries were imported and none exist in the project.")
 
     mcp._pyghidra_context = pyghidra_context  # type: ignore
-    logger.info("Server intialized")
+    logger.info("Server initialized")
 
     # Start concurrency safety infrastructure
+    _start_infrastructure(pyghidra_context)
+
+    return mcp
+
+
+def _start_infrastructure(pyghidra_context) -> None:
     executor = GhidraExecutor(
         max_queue_size=100,
         task_timeout=60.0,
@@ -199,6 +206,89 @@ def init_pyghidra_context(  # noqa: C901
     watchdog.start()
     set_watchdog(watchdog)
 
+
+def init_lazy_pyghidra_context(
+    mcp: FastMCP,
+    *,
+    input_paths: list[Path],
+    project_name: str,
+    project_directory: str,
+    pyghidra_mcp_dir: Path,
+    force_analysis: bool,
+    verbose_analysis: bool,
+    no_symbols: bool,
+    gdts: list[str],
+    program_options_path: str | None,
+    gzfs_path: str | None,
+    threaded: bool,
+    max_workers: int,
+    wait_for_analysis: bool,
+    symbols_path: str | None,
+    sym_file_path: str | None,
+) -> FastMCP:
+    """Initialize with deferred JVM startup for fast stdio connection.
+
+    The MCP server accepts connections immediately. JVM starts in
+    a background thread. Tools return 'Ghidra is starting...' until ready.
+    """
+    bin_paths: list[str | Path] = [Path(p) for p in input_paths]
+    logger.info("Project: %s", project_name)
+    logger.info("Project: Location %s", project_directory)
+
+    program_options: dict | None = None
+    if program_options_path:
+        with open(program_options_path) as f:
+            program_options = json.load(f)
+
+    def _build_real_context():
+        """Build the real PyGhidraContext once JVM is ready."""
+        logger.info("Starting Ghidra JVM (lazy init)...")
+        pyghidra.start(False)
+
+        logger.info("Initializing Ghidra project...")
+        ctx = PyGhidraContext(
+            project_name=project_name,
+            project_path=project_directory,
+            pyghidra_mcp_dir=pyghidra_mcp_dir,
+            force_analysis=force_analysis,
+            verbose_analysis=verbose_analysis,
+            no_symbols=no_symbols,
+            gdts=gdts,
+            program_options=program_options,
+            gzfs_path=gzfs_path,
+            threaded=threaded,
+            max_workers=max_workers,
+            wait_for_analysis=wait_for_analysis,
+            symbols_path=symbols_path,
+            sym_file_path=sym_file_path,
+        )
+
+        if len(bin_paths) > 0:
+            logger.info("Importing binaries: %s", ", ".join(map(str, bin_paths)))
+            imported = ctx.import_binaries(bin_paths)
+            if imported or force_analysis or wait_for_analysis:
+                ctx.analyze_project()
+                if wait_for_analysis:
+                    ctx.schedule_startup_indexing(max_binaries=max(len(ctx.programs), 1))
+                else:
+                    for binary_name in imported:
+                        ctx.schedule_indexing(binary_name)
+            else:
+                ctx.schedule_startup_indexing()
+        else:
+            logger.info("No binaries to import; using existing project state.")
+            ctx.schedule_startup_indexing()
+
+        if len(ctx.list_binaries()) == 0:
+            logger.warning("No binaries were imported and none exist in the project.")
+
+        logger.info("Server initialized")
+        _start_infrastructure(ctx)
+        return ctx
+
+    lazy = LazyPyGhidraContext(context_init_fn=_build_real_context)
+    lazy.start_background_init()
+    mcp._pyghidra_context = lazy  # type: ignore
     return mcp
 
 
@@ -498,27 +588,47 @@ def main(
             ) from cause
         return
 
-    init_pyghidra_context(
-        mcp=mcp,
-        input_paths=input_paths,
-        transport=transport,
-        project_name=project_name,
-        project_directory=project_directory,
-        force_analysis=force_analysis,
-        verbose_analysis=verbose_analysis,
-        no_symbols=no_symbols,
-        gdts=list(gdt),
-        program_options_path=program_options,
-        gzfs_path=gzfs_path,
-        threaded=threaded,
-        max_workers=max_workers,
-        wait_for_analysis=wait_for_analysis,
-        list_project_binaries=list_project_binaries,
-        delete_project_binary=delete_project_binary,
-        pyghidra_mcp_dir=pyghidra_mcp_dir,
-        sym_file_path=sym_file_path,
-        symbols_path=symbols_path,
-    )
+    if transport == "stdio" and not (list_project_binaries or delete_project_binary):
+        init_lazy_pyghidra_context(
+            mcp=mcp,
+            input_paths=input_paths,
+            project_name=project_name,
+            project_directory=project_directory,
+            force_analysis=force_analysis,
+            verbose_analysis=verbose_analysis,
+            no_symbols=no_symbols,
+            gdts=list(gdt),
+            program_options_path=program_options,
+            gzfs_path=gzfs_path,
+            threaded=threaded,
+            max_workers=max_workers,
+            wait_for_analysis=wait_for_analysis,
+            pyghidra_mcp_dir=pyghidra_mcp_dir,
+            symbols_path=symbols_path,
+            sym_file_path=sym_file_path,
+        )
+    else:
+        init_pyghidra_context(
+            mcp=mcp,
+            input_paths=input_paths,
+            transport=transport,
+            project_name=project_name,
+            project_directory=project_directory,
+            force_analysis=force_analysis,
+            verbose_analysis=verbose_analysis,
+            no_symbols=no_symbols,
+            gdts=list(gdt),
+            program_options_path=program_options,
+            gzfs_path=gzfs_path,
+            threaded=threaded,
+            max_workers=max_workers,
+            wait_for_analysis=wait_for_analysis,
+            list_project_binaries=list_project_binaries,
+            delete_project_binary=delete_project_binary,
+            pyghidra_mcp_dir=pyghidra_mcp_dir,
+            sym_file_path=sym_file_path,
+            symbols_path=symbols_path,
+        )
 
     try:
         run_mcp_server(mcp, transport)
