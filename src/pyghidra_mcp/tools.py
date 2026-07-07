@@ -26,6 +26,7 @@ from pyghidra_mcp.models import (
     SearchMode,
     StringInfo,
     StringSearchResult,
+    SurveyBinaryResult,
     SymbolInfo,
 )
 
@@ -386,6 +387,26 @@ class GhidraTools:
                 logger.debug(f"Could not get string value from data at {data.getAddress()}: {e}")
 
         return strings, dropped
+
+    @handle_exceptions
+    def survey_binary(self, detail_level: str = "standard") -> SurveyBinaryResult:
+        """Single-call binary triage snapshot.
+
+        Returns file metadata, segment layout, entry points, statistics,
+        top 15 strings/functions ranked by xref count (functions include
+        a ``type`` field: thunk/wrapper/leaf/dispatcher/complex), imports
+        grouped by category, and a call-graph summary. Use this as your
+        FIRST tool call when starting analysis. Pass
+        ``detail_level='minimal'`` for binaries with more than ~10k
+        functions.
+        """
+        from pyghidra_mcp import api_survey
+
+        if detail_level not in ("standard", "minimal"):
+            raise ValueError("detail_level must be 'standard' or 'minimal'")
+
+        raw = api_survey.survey_binary(self.program, detail_level=detail_level)
+        return SurveyBinaryResult.model_validate(raw)
 
     @staticmethod
     def _matches_query(query: str, symbol_name: str) -> bool:

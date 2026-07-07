@@ -267,3 +267,98 @@ class CallGraphResult(BaseModel):
     display_type: CallGraphDisplayType
     graph: str = Field(..., description="MermaidJS graph string")
     mermaid_url: str
+
+
+class SurveyMetadata(BaseModel):
+    path: str
+    module: str
+    arch: str
+    base_address: str
+    image_size: str
+    md5: str
+    sha256: str
+
+
+class SurveySegmentInfo(BaseModel):
+    name: str
+    start: str
+    end: str
+    size: str
+    permissions: str
+
+
+class SurveyEntrypoint(BaseModel):
+    addr: str
+    name: str
+
+
+class SurveyStatistics(BaseModel):
+    total_functions: int
+    named_functions: int
+    library_functions: int
+    unnamed_functions: int
+    thunk_functions: int
+    total_strings: int
+    total_segments: int
+
+
+class SurveyInterestingString(BaseModel):
+    addr: str
+    string: str
+    xref_count: int
+
+
+class SurveyInterestingFunction(BaseModel):
+    addr: str
+    name: str
+    size: int
+    xref_count: int
+    callee_count: int
+    type: str
+
+
+class SurveyImportEntry(BaseModel):
+    addr: str
+    name: str
+    library: str
+
+
+class SurveyImportsByCategory(BaseModel):
+    crypto: list[SurveyImportEntry] = Field(default_factory=list)
+    network: list[SurveyImportEntry] = Field(default_factory=list)
+    file_io: list[SurveyImportEntry] = Field(default_factory=list)
+    process: list[SurveyImportEntry] = Field(default_factory=list)
+    registry: list[SurveyImportEntry] = Field(default_factory=list)
+    other: list[SurveyImportEntry] = Field(default_factory=list)
+
+
+class SurveyCallGraphSummary(BaseModel):
+    total_edges: int
+    max_depth_estimate: int | None = None
+    root_functions: list[str] = Field(default_factory=list)
+    leaf_functions_count: int = 0
+
+
+class SurveyRecommendedTools(BaseModel):
+    interesting_strings: str
+    interesting_functions: str
+    imports_by_category: str
+    call_graph_summary: str
+    overall: str
+
+
+class SurveyBinaryResult(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    ok: bool
+    metadata: SurveyMetadata
+    statistics: SurveyStatistics
+    segments: list[SurveySegmentInfo]
+    entrypoints: list[SurveyEntrypoint]
+    interesting_strings: list[SurveyInterestingString] | None = None
+    interesting_functions: list[SurveyInterestingFunction] | None = None
+    imports_by_category: SurveyImportsByCategory | None = None
+    call_graph_summary: SurveyCallGraphSummary | None = None
+    recommended_tools: SurveyRecommendedTools | None = None
+    note: str | None = None
+    error: str | None = None

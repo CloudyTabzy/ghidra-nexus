@@ -39,6 +39,7 @@ from pyghidra_mcp.models import (
     SaveRequestResult,
     SearchMode,
     StringSearchResults,
+    SurveyBinaryResult,
     SymbolSearchResults,
     VariableRenameResponse,
     VariableTypeResponse,
@@ -598,6 +599,47 @@ async def analysis_status(ctx: Context) -> ProgramInfos:
     """
     pyghidra_context = _get_context(ctx)
     return ProgramInfos(programs=pyghidra_context.list_project_binary_infos())
+
+
+@mcp_error_handler
+async def survey_binary(
+    binary_name: str,
+    ctx: Context,
+    detail_level: Literal["standard", "minimal"] = "standard",
+) -> SurveyBinaryResult:
+    """Single-call binary triage snapshot.
+
+    Returns file metadata, segment layout, entry points, statistics, top 15
+    strings/functions ranked by xref count (functions include a ``type`` field:
+    thunk/wrapper/leaf/dispatcher/complex), imports grouped by category, and a
+    call-graph summary. Use this as your FIRST tool call when starting
+    analysis. Pass ``detail_level='minimal'`` for binaries with more than
+    ~10k functions. Refuses to run while Ghidra analysis is in progress —
+    call ``analysis_status`` first to check.
+    """
+    pyghidra_context = _get_context(ctx)
+    program_info = pyghidra_context.get_program_info(binary_name)
+    tools = GhidraTools(program_info)
+
+    if not program_info.analysis_complete:
+        raise McpError(
+            ErrorData(
+                code=INVALID_PARAMS,
+                message=(
+                    f"Ghidra analysis for '{binary_name}' is still in progress. "
+                    "Wait for analysis_status to report complete, then retry."
+                ),
+            )
+        )
+
+    def _run():
+        return tools.survey_binary(detail_level=detail_level)
+
+    return await get_executor().submit(
+        program_info,
+        _run,
+        task_id=f"survey:{binary_name}:{detail_level}",
+    )
 
 
 @mcp_error_handler
