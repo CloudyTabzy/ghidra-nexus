@@ -1,6 +1,6 @@
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class DecompiledFunction(BaseModel):
@@ -8,7 +8,13 @@ class DecompiledFunction(BaseModel):
     code: str
     signature: str | None = None
     error: str | None = None
-    # Rich response fields (populated when include_* flags are set)
+    decompiler_status: str | None = Field(
+        None,
+        description=(
+            "decompiled (success), decompiled_empty (no C output but no error), "
+            "decompiler_error (Ghidra decompiler failed)"
+        ),
+    )
     callees: list[str] | None = None
     referenced_strings: list[str] | None = None
     xrefs: list["CrossReferenceInfo"] | None = None
@@ -63,7 +69,8 @@ class ImportRequestResult(BaseModel):
 
 
 class SaveRequestResult(BaseModel):
-    pass
+    model_config = ConfigDict(extra="allow")
+
 
 class GotoResponse(BaseModel):
     binary_name: str
@@ -204,12 +211,21 @@ class StringInfo(BaseModel):
     address: str
 
 
+class StringDroppedNote(BaseModel):
+    count: int
+    message: str
+
+
 class StringSearchResult(StringInfo):
     similarity: float
 
 
 class StringSearchResults(BaseModel):
     strings: list[StringSearchResult]
+    dropped_note: StringDroppedNote | None = Field(
+        None,
+        description="Present when some string values could not be read (corrupted data)",
+    )
 
 
 class BytesReadResult(BaseModel):

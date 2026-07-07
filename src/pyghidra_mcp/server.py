@@ -17,9 +17,11 @@ from mcp.server.fastmcp import FastMCP
 from pyghidra_mcp import __version__, mcp_tools
 from pyghidra_mcp.context import PyGhidraContext
 from pyghidra_mcp.context_protocol import MCPContext
+from pyghidra_mcp.ghidra_executor import GhidraExecutor, set_executor
 from pyghidra_mcp.gui_context import GuiPyGhidraContext
 from pyghidra_mcp.gui_launcher import GuiPyGhidraMcpLauncher, ensure_macos_framework_python
 from pyghidra_mcp.project_spec import DEFAULT_PROJECT_NAME, ProjectSpec
+from pyghidra_mcp.watchdog import Watchdog, set_watchdog
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,8 +39,13 @@ async def server_lifespan(server: Server) -> AsyncIterator[MCPContext]:
     try:
         yield server._pyghidra_context  # type: ignore
     finally:
-        # pyghidra_context.close()
-        pass
+        context = getattr(server, "_pyghidra_context", None)
+        if context is not None:
+            try:
+                context.save()
+            except Exception:
+                logger.warning("Failed to save context during lifespan shutdown", exc_info=True)
+            context.close()
 
 
 mcp = FastMCP("pyghidra-mcp", lifespan=server_lifespan)  # type: ignore
@@ -178,6 +185,20 @@ def init_pyghidra_context(  # noqa: C901
     mcp._pyghidra_context = pyghidra_context  # type: ignore
     logger.info("Server intialized")
 
+    # Start concurrency safety infrastructure
+    executor = GhidraExecutor(
+        max_queue_size=100,
+        task_timeout=60.0,
+    )
+    executor.start()
+    set_executor(executor)
+    watchdog = Watchdog(
+        executor=executor,
+        get_programs=lambda: pyghidra_context.programs,
+    )
+    watchdog.start()
+    set_watchdog(watchdog)
+
     return mcp
 
 
@@ -195,6 +216,21 @@ def init_gui_context(
     gui_context.schedule_startup_indexing()
     mcp._pyghidra_context = gui_context  # type: ignore
     logger.info("GUI-backed server initialized")
+
+    executor = GhidraExecutor(
+        max_queue_size=100,
+        task_timeout=60.0,
+    )
+    executor.start()
+    set_executor(executor)
+    watchdog = Watchdog(
+        executor=executor,
+        get_programs=lambda: getattr(mcp, "_pyghidra_context", None)
+        and getattr(mcp._pyghidra_context, "programs", {}),
+    )
+    watchdog.start()
+    set_watchdog(watchdog)
+
     return mcp
 
 
@@ -441,11 +477,25 @@ def main(
         finally:
             launcher.request_shutdown()
             launcher.wait_for_shutdown()
+            from pyghidra_mcp.ghidra_executor import get_executor as _ge
+            from pyghidra_mcp.watchdog import get_watchdog as _gw
+            wd = _gw()
+            if wd is not None:
+                wd.stop()
+            executor = _ge()
+            if executor is not None:
+                executor.shutdown(timeout=5.0)
             context = getattr(mcp, "_pyghidra_context", None)
             if context is not None:
                 context.close()
         if gui_server_error:
-            raise RuntimeError("GUI MCP server failed to start.") from gui_server_error[0]
+            cause = gui_server_error[0]
+            raise RuntimeError(
+                f"GUI MCP server failed to start. "
+                f"Cause: {cause}. "
+                f"Check that the Ghidra GUI launched and the project '{project_spec.gpr_path}' "
+                f"became active within the readiness timeout."
+            ) from cause
         return
 
     init_pyghidra_context(
@@ -473,6 +523,15 @@ def main(
     try:
         run_mcp_server(mcp, transport)
     finally:
+        from pyghidra_mcp.ghidra_executor import get_executor as _ge
+        from pyghidra_mcp.watchdog import get_watchdog as _gw
+
+        wd = _gw()
+        if wd is not None:
+            wd.stop()
+        executor = _ge()
+        if executor is not None:
+            executor.shutdown(timeout=5.0)
         mcp._pyghidra_context.close()  # type: ignore
 
 

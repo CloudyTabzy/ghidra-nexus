@@ -138,8 +138,12 @@ class GhidraTools:
                     func = fm.getFunctionContaining(addr)
                 if func:
                     return [func]
-        except Exception:
-            pass  # Not an address, fall back to name search
+        except (Exception) as e:
+            from java.lang import IllegalArgumentException
+            from ghidra.program.model.address import AddressFormatException
+
+            if not isinstance(e, (IllegalArgumentException, AddressFormatException)):
+                raise
 
         name_lc = name_or_address.lower()
         functions = self.get_all_functions(include_externals=include_externals)
@@ -226,8 +230,12 @@ class GhidraTools:
                 addr_symbols = st.getSymbols(addr)
                 if addr_symbols:
                     return list(addr_symbols)
-        except Exception:
-            pass  # Not an address, fall back to name search
+        except (Exception) as e:
+            from java.lang import IllegalArgumentException
+            from ghidra.program.model.address import AddressFormatException
+
+            if not isinstance(e, (IllegalArgumentException, AddressFormatException)):
+                raise
 
         name_lc = name_or_address.lower()
         matches: set[Symbol] = set()
@@ -297,13 +305,18 @@ class GhidraTools:
             if decompiled is None:
                 code = ""
                 sig = None
+                status = "decompiled_empty"
             else:
                 code = decompiled.getC()
                 sig = decompiled.getSignature()
+                status = "decompiled"
         else:
             code = result.getErrorMessage()
             sig = None
-        return DecompiledFunction(name=self._get_filename(func), code=code, signature=sig)
+            status = "decompiler_error"
+        return DecompiledFunction(
+            name=self._get_filename(func), code=code, signature=sig, decompiler_status=status
+        )
 
     @handle_exceptions
     def get_all_functions(self, include_externals=False) -> list["Function"]:
@@ -348,27 +361,31 @@ class GhidraTools:
         return list(symbols)
 
     @handle_exceptions
-    def get_all_strings(self) -> list[StringInfo]:
-        """Gets all defined strings for a binary"""
+    def get_all_strings(self) -> tuple[list[StringInfo], int]:
+        """Gets all defined strings for a binary.
+        Returns (strings, dropped_count) where dropped_count is the number
+        of string values that could not be read due to corruption.
+        """
         try:
             from ghidra.program.util import DefinedStringIterator  # type: ignore
 
             data_iterator = DefinedStringIterator.forProgram(self.program)
         except ImportError:
-            # Support Ghidra 11.3.2
             from ghidra.program.util import DefinedDataIterator
 
             data_iterator = DefinedDataIterator.definedStrings(self.program)
 
         strings = []
+        dropped = 0
         for data in data_iterator:
             try:
                 string_value = data.getValue()
                 strings.append(StringInfo(value=str(string_value), address=str(data.getAddress())))
             except Exception as e:
+                dropped += 1
                 logger.debug(f"Could not get string value from data at {data.getAddress()}: {e}")
 
-        return strings
+        return strings, dropped
 
     @staticmethod
     def _matches_query(query: str, symbol_name: str) -> bool:
@@ -621,7 +638,12 @@ class GhidraTools:
         preview_length: int,
         total_functions: int,  # Added total_functions to correctly calculate semantic_total
     ) -> tuple[list[CodeSearchResult], int]:  # Changed return type to int for semantic_total
-        assert self.program_info.code_collection is not None
+        if self.program_info.code_collection is None:
+            raise ValueError(
+                "Code indexing is not complete for this binary. "
+                "Semantic search and literal search are not available yet. "
+                "Wait a few seconds and retry."
+            )
         search_results: list[CodeSearchResult] = []
         # Semantic search
         results = self.program_info.code_collection.query(

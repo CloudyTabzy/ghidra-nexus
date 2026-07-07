@@ -1,11 +1,10 @@
 import concurrent.futures
 import hashlib
-import json
 import logging
 import multiprocessing
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Union
 
@@ -46,6 +45,8 @@ class ProgramInfo:
     load_time: float | None = None
     code_collection: chromadb.Collection | None = None
     strings: list | None = None
+    rw_lock: threading.RLock = field(default_factory=threading.RLock)
+    dead: bool = False
 
     @property
     def analysis_complete(self) -> bool:
@@ -59,6 +60,7 @@ class PyGhidraContext(IndexingMixin):
     """
 
     _analysis_bundle_host_lock = threading.RLock()
+    _programs_lock = threading.RLock()
 
     def __init__(
         self,
@@ -129,7 +131,7 @@ class PyGhidraContext(IndexingMixin):
         self.max_workers = max_workers if max_workers else cpu_count
 
         if not self.threaded:
-            logger.warn("--no-threaded flag forcing max_workers to 1")
+            logger.warning("--no-threaded flag forcing max_workers to 1")
             self.max_workers = 1
         self._init_indexing_state(self.pyghidra_mcp_dir, threaded=self.threaded)
         self.executor = (
@@ -145,9 +147,13 @@ class PyGhidraContext(IndexingMixin):
         self.programs: dict[str, ProgramInfo] = {}
         self._init_project_programs()
 
-    def close(self, save: bool = True):
+    def close(self, save: bool = True, shutdown_timeout: float = 10.0):
         """
         Saves changes to all open programs and closes the project.
+
+        Args:
+            save: Whether to save the project before closing.
+            shutdown_timeout: Maximum seconds to wait for decompiler disposal.
         """
         if self.executor:
             self.executor.shutdown(wait=True)
@@ -157,12 +163,40 @@ class PyGhidraContext(IndexingMixin):
         if self.import_executor:
             self.import_executor.shutdown(wait=True)
 
-        for _program_name, program_info in self.programs.items():
-            self._dispose_decompiler(program_info)
+        with self._programs_lock:
+            programs_snapshot = list(self.programs.items())
+
+        for _program_name, program_info in programs_snapshot:
+            program_info.dead = True
+        for _program_name, program_info in programs_snapshot:
+            import threading as _threading
+
+            disposed = _threading.Event()
+
+            def _dispose():
+                try:
+                    self._dispose_decompiler(program_info)
+                finally:
+                    disposed.set()
+
+            t = _threading.Thread(target=_dispose, daemon=True)
+            t.start()
+            if not disposed.wait(timeout=shutdown_timeout):
+                logger.warning(
+                    "Decompiler disposal timed out after %.0fs for %s; skipping.",
+                    shutdown_timeout,
+                    _program_name,
+                )
             program = program_info.program
             if save:
-                self.project.save(program)
-            self.project.close(program)
+                try:
+                    self.project.save(program)
+                except Exception:
+                    logger.error("Failed to save program %s during close", _program_name, exc_info=True)
+            try:
+                self.project.close(program)
+            except Exception:
+                logger.error("Failed to close program %s", _program_name, exc_info=True)
 
         self.project.close()
         logger.info(f"Project {self.project_name} closed.")
@@ -171,8 +205,9 @@ class PyGhidraContext(IndexingMixin):
         """
         Save changes to all open programs.
         """
-        for program_info in self.programs.values():
-            self.project.save(program_info.program)
+        with self._programs_lock:
+            for program_info in self.programs.values():
+                self.project.save(program_info.program)
 
     def _get_or_create_project(self) -> "GhidraProject":
         """
@@ -210,7 +245,8 @@ class PyGhidraContext(IndexingMixin):
             parent_path = parent.pathname if parent else "/"
             program: Program = self.project.openProgram(parent_path, domain_file.getName(), False)
             program_info = self._init_program_info(program)
-            self.programs[domain_file.pathname] = program_info
+            with self._programs_lock:
+                self.programs[domain_file.pathname] = program_info
 
     def list_binaries(self) -> list[str]:
         """List all the binaries within the Ghidra project."""
@@ -227,12 +263,15 @@ class PyGhidraContext(IndexingMixin):
 
     def list_program_infos(self) -> list[ProgramInfo]:
         """Return loaded program infos for MCP project listing."""
-        return list(self.programs.values())
+        with self._programs_lock:
+            return list(self.programs.values())
 
     def list_project_binary_infos(self) -> list[ProgramInfoModel]:
         """Return MCP response models for project binaries."""
         program_infos = []
-        for name, pi in self.programs.items():
+        with self._programs_lock:
+            items = list(self.programs.items())
+        for name, pi in items:
             program_infos.append(
                 ProgramInfoModel(
                     name=name,
@@ -268,6 +307,8 @@ class PyGhidraContext(IndexingMixin):
     def delete_program(self, program_name: str) -> bool:
         """
         Deletes a program from the Ghidra project and saves the project.
+        Sets the program dead flag first to prevent any concurrent access,
+        then performs the deletion atomically.
 
         Args:
             program_name: The name of the program to delete.
@@ -275,26 +316,28 @@ class PyGhidraContext(IndexingMixin):
         Returns:
             True if the program was deleted successfully, False otherwise.
         """
-        program_info = self.programs.get(program_name)
+        with self._programs_lock:
+            program_info = self.programs.get(program_name)
         if not program_info:
-            available_progs = list(self.programs.keys())
+            with self._programs_lock:
+                available_progs = list(self.programs.keys())
             raise ValueError(
                 f"Binary {program_name} not found. Available binaries: {available_progs}"
             )
-        else:
-            logger.info(f"Deleting program: {program_name}")
-            try:
-                program_to_delete: Program = program_info.program
-                program_to_delete_df: DomainFile = program_to_delete.getDomainFile()
-                self._dispose_decompiler(program_info)
-                self.project.close(program_to_delete)
-                program_to_delete_df.delete()
-                # clean up program reference
-                del self.programs[program_name]
-                return True
-            except Exception as e:
-                logger.error(f"Error deleting program '{program_name}': {e}")
-                return False
+        program_info.dead = True
+        logger.info(f"Deleting program: {program_name}")
+        try:
+            program_to_delete: Program = program_info.program
+            program_to_delete_df: DomainFile = program_to_delete.getDomainFile()
+            self._dispose_decompiler(program_info)
+            self.project.close(program_to_delete)
+            program_to_delete_df.delete()
+            with self._programs_lock:
+                self.programs.pop(program_name, None)
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting program '{program_name}': {e}")
+            return False
 
     def import_binary(
         self, binary_path: str | Path, analyze: bool = False, relative_path: Path | None = None
@@ -329,10 +372,12 @@ class PyGhidraContext(IndexingMixin):
 
         # Check if program already exists at this location
         full_path = str(Path(ghidra_folder.pathname) / program_name)
-        if self.programs.get(full_path):
+        with self._programs_lock:
+            existing = self.programs.get(full_path)
+        if existing:
             logger.info(f"Opening existing program: {program_name}")
-            program = self.programs[full_path].program
-            program_info = self.programs[full_path]
+            program = existing.program
+            program_info = existing
         else:
             logger.info(f"Importing new program: {program_name}")
             imported_program = self.project.importProgram(binary_path)
@@ -344,7 +389,8 @@ class PyGhidraContext(IndexingMixin):
                 program = self.project.openProgram(ghidra_folder.pathname, program_name, False)
 
             program_info = self._init_program_info(program)
-            self.programs[program.getDomainFile().pathname] = program_info
+            with self._programs_lock:
+                self.programs[program.getDomainFile().pathname] = program_info
 
         if not program:
             raise ImportError(f"Failed to import binary: {binary_path}")
@@ -442,8 +488,7 @@ class PyGhidraContext(IndexingMixin):
             result = future.result()
             logger.info(f"Background import task completed successfully. Result: {result}")
         except Exception as e:
-            logger.error(f"FATAL ERROR during background binary import: {e}", exc_info=True)
-            raise e
+            logger.error(f"Background binary import failed: {e}", exc_info=True)
 
     def import_binary_backgrounded(self, binary_path: str | Path) -> ImportRequestResult:
         """
@@ -491,35 +536,36 @@ class PyGhidraContext(IndexingMixin):
         """Get program info or raise ValueError if not found."""
         program_info = self._lookup_program_info(binary_name)
         if not program_info:
-            # Exact program name not in the list
-            available_progs = list(self.programs.keys())
+            with self._programs_lock:
+                available_progs = list(self.programs.keys())
             raise ValueError(
-                f"Binary {binary_name} not found. Available binaries: {available_progs}"
+                f"Binary '{binary_name}' not found. Available binaries: {available_progs}"
+            )
+        if program_info.dead:
+            raise RuntimeError(
+                f"Binary '{binary_name}' has been deleted and is no longer available."
             )
         if not program_info.analysis_complete:
             raise RuntimeError(
-                json.dumps(
-                    {
-                        "message": f"Analysis incomplete for binary '{binary_name}'.",
-                        "binary_name": binary_name,
-                        "ghidra_analysis_complete": program_info.ghidra_analysis_complete,
-                        "code_indexed": program_info.code_collection is not None,
-                        "strings_indexed": program_info.strings is not None,
-                        "suggestion": "Wait and try tool call again.",
-                    }
-                )
+                f"Analysis incomplete for binary '{binary_name}'. "
+                f"Ghidra analysis: {'complete' if program_info.ghidra_analysis_complete else 'in progress'}. "
+                f"Code index: {'ready' if program_info.code_collection is not None else 'pending'}. "
+                f"String index: {'ready' if program_info.strings is not None else 'pending'}. "
+                f"Wait a few seconds and retry."
             )
-        self.schedule_indexing(binary_name)
+        self.schedule_indexing(program_info.name)
         return program_info
 
     def _lookup_program_info(self, binary_name: str) -> "ProgramInfo | None":
-        program_info = self.programs.get(binary_name)
+        with self._programs_lock:
+            program_info = self.programs.get(binary_name)
         if program_info is not None:
             return program_info
 
-        available_prog_names = {
-            Path(prog).name: prog_info for prog, prog_info in self.programs.items()
-        }
+        with self._programs_lock:
+            available_prog_names = {
+                Path(prog).name: prog_info for prog, prog_info in self.programs.items()
+            }
         return available_prog_names.get(binary_name)
 
     def _init_program_info(self, program):
@@ -536,7 +582,7 @@ class PyGhidraContext(IndexingMixin):
             decompiler_pool=self._create_decompiler_pool(program),
             metadata=metadata,
             ghidra_analysis_complete=False,
-            file_path=metadata["Executable Location"],
+            file_path=metadata.get("Executable Location"),
             load_time=time.time(),
             code_collection=None,
             strings=None,
@@ -572,7 +618,6 @@ class PyGhidraContext(IndexingMixin):
                 self.schedule_startup_indexing(max_binaries=max(len(self.programs), 1))
         except Exception as e:
             logging.error(f"Asynchronous analysis failed with exception: {e}")
-            raise e
 
     def analyze_project(
         self,
@@ -666,13 +711,17 @@ class PyGhidraContext(IndexingMixin):
         if not isinstance(df_or_prog, DomainFile):
             df = df_or_prog.getDomainFile()
 
-        if self.programs.get(df.pathname):
+        with self._programs_lock:
+            existing = self.programs.get(df.pathname)
+        if existing:
             # program already opened and initialized
-            program = self.programs[df.pathname].program
+            program = existing.program
         else:
             # open program from Ghidra Project
             program = self.project.openProgram(df.getParent().pathname, df_or_prog.getName(), False)
-            self.programs[df.pathname] = self._init_program_info(program)
+            info = self._init_program_info(program)
+            with self._programs_lock:
+                self.programs[df.pathname] = info
 
         assert isinstance(program, Program)
 
@@ -722,7 +771,7 @@ class PyGhidraContext(IndexingMixin):
                         self.set_analysis_option(program, k, v)
 
                 if self.no_symbols:
-                    logger.warn(
+                    logger.warning(
                         f"Disabling symbols for analysis! --no-symbols flag: {self.no_symbols}"
                     )
                     self.set_analysis_option(program, "PDB Universal", False)
@@ -740,7 +789,7 @@ class PyGhidraContext(IndexingMixin):
                     # Verify PDB loaded
                     pdb = get_pdb(program)
                     if pdb is None:
-                        logger.warn(f"Failed to find pdb for {program.name}")
+                        logger.warning(f"Failed to find pdb for {program.name}")
                     else:
                         logger.info(f"Loaded pdb: {pdb}")
 
@@ -768,7 +817,10 @@ class PyGhidraContext(IndexingMixin):
             self.project.saveAsPackedFile(program, File(str(gzf_file.absolute())), True)
 
         logger.info(f"Analysis for {df_or_prog.getName()} complete")
-        self.programs[df.pathname].ghidra_analysis_complete = True
+        with self._programs_lock:
+            info = self.programs.get(df.pathname)
+            if info is not None:
+                info.ghidra_analysis_complete = True
         return df_or_prog
 
     def set_analysis_option(  # noqa: C901
@@ -858,7 +910,8 @@ class PyGhidraContext(IndexingMixin):
         # This is a simplification. A real implementation would need to configure the symbol server
         # which is more involved. For now, we'll focus on enabling the analyzers.
 
-        for program_name, program in self.programs.items():
+        with self._programs_lock:
+            for program_name, program in self.programs.items():
             logger.info(f"Configuring symbols for {program_name}")
             try:
                 if hasattr(PdbUniversalAnalyzer, "setAllowUntrustedOption"):  # Ghidra 11.2+
@@ -940,7 +993,7 @@ class PyGhidraContext(IndexingMixin):
         return decomp
 
     def _create_decompiler_pool(self, program: "Program") -> DecompilerPool:
-        pool_size = 2 if self.threaded else 1
+        pool_size = 4 if self.threaded else 1
         return DecompilerPool(lambda: self.setup_decompiler(program), size=pool_size)
 
     @staticmethod

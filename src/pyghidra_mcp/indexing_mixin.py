@@ -25,9 +25,24 @@ class IndexingMixin:
     def _init_indexing_state(self, pyghidra_mcp_dir: Path, *, threaded: bool) -> None:
         chromadb_path = pyghidra_mcp_dir / "chromadb"
         chromadb_path.mkdir(parents=True, exist_ok=True)
-        self.chroma_client = chromadb.PersistentClient(
-            path=str(chromadb_path), settings=Settings(anonymized_telemetry=False)
-        )
+        try:
+            self.chroma_client = chromadb.PersistentClient(
+                path=str(chromadb_path), settings=Settings(anonymized_telemetry=False)
+            )
+        except Exception as e:
+            logger.critical(
+                "Failed to initialize ChromaDB at %s: %s. "
+                "Creating a fresh ChromaDB directory.",
+                chromadb_path, e,
+            )
+            import shutil
+            shutil.rmtree(str(chromadb_path), ignore_errors=True)
+            chromadb_path.mkdir(parents=True, exist_ok=True)
+            self.chroma_client = chromadb.PersistentClient(
+                path=str(chromadb_path), settings=Settings(anonymized_telemetry=False)
+            )
+            logger.info("ChromaDB re-initialized at %s", chromadb_path)
+        self.chroma_client.heartbeat()
         self.index_executor = (
             concurrent.futures.ThreadPoolExecutor(max_workers=1) if threaded else None
         )
@@ -145,6 +160,7 @@ class IndexingMixin:
         decompiles = []
         ids = []
         metadatas = []
+        failed_count = 0
 
         for i, func in enumerate(functions):
             func: Function
@@ -161,7 +177,26 @@ class IndexingMixin:
                     }
                 )
             except Exception as e:
+                failed_count += 1
                 logger.error("Failed to decompile %s: %s", func.getSymbol().getName(True), e)
+
+        total_functions = len(functions)
+        failure_pct = (failed_count / total_functions * 100) if total_functions > 0 else 0
+        MAX_FAILURE_PCT = 1.0
+
+        if failure_pct > MAX_FAILURE_PCT:
+            logger.error(
+                "Code index for '%s': %d/%d functions failed to decompile (%.1f%%). "
+                "Collection will NOT be marked complete and will be rebuilt on next startup.",
+                program_info.name, failed_count, total_functions, failure_pct,
+            )
+            logger.warning(
+                "Code index for '%s' is incomplete: %d of %d functions could not be "
+                "decompiled. Semantic search results may be incomplete. "
+                "Check Ghidra health or re-open the binary with fresh analysis.",
+                program_info.name, failed_count, total_functions,
+            )
+            return
 
         # Created with the completion marker off; an interruption before the
         # marker is flipped below leaves a collection that reads as incomplete
@@ -185,7 +220,14 @@ class IndexingMixin:
 
     def _init_strings_for_program(self, program_info: Any) -> None:
         logger.info("Loading strings for %s", program_info.name)
-        program_info.strings = GhidraTools(program_info).get_all_strings()
+        strings, dropped = GhidraTools(program_info).get_all_strings()
+        if dropped > 0:
+            logger.warning(
+                "%d string values could not be read for '%s' (corrupted data). "
+                "The string listing is incomplete.",
+                dropped, program_info.name,
+            )
+        program_info.strings = strings
         logger.info("Loaded %s strings for %s", len(program_info.strings), program_info.name)
 
     def _index_program(
