@@ -92,7 +92,6 @@ class Watchdog:
 
     def _check_error_rate(self) -> None:
         now = time.time()
-        self._error_timestamps.append(now)
         cutoff = now - 60
         while self._error_timestamps and self._error_timestamps[0] < cutoff:
             self._error_timestamps.popleft()
