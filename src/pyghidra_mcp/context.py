@@ -912,24 +912,24 @@ class PyGhidraContext(IndexingMixin):
 
         with self._programs_lock:
             for program_name, program in self.programs.items():
-            logger.info(f"Configuring symbols for {program_name}")
-            try:
-                if hasattr(PdbUniversalAnalyzer, "setAllowUntrustedOption"):  # Ghidra 11.2+
-                    PdbUniversalAnalyzer.setAllowUntrustedOption(program, allow_remote)
-                    PdbAnalyzer.setAllowUntrustedOption(program, allow_remote)
-                else:  # Ghidra < 11.2
-                    PdbUniversalAnalyzer.setAllowRemoteOption(program, allow_remote)
-                    PdbAnalyzer.setAllowRemoteOption(program, allow_remote)
+                logger.info(f"Configuring symbols for {program_name}")
+                try:
+                    if hasattr(PdbUniversalAnalyzer, "setAllowUntrustedOption"):  # Ghidra 11.2+
+                        PdbUniversalAnalyzer.setAllowUntrustedOption(program, allow_remote)
+                        PdbAnalyzer.setAllowUntrustedOption(program, allow_remote)
+                    else:  # Ghidra < 11.2
+                        PdbUniversalAnalyzer.setAllowRemoteOption(program, allow_remote)
+                        PdbAnalyzer.setAllowRemoteOption(program, allow_remote)
 
-                # The following is a placeholder for actual symbol loading logic
-                pdb_attr = PdbProgramAttributes(program)
-                if not pdb_attr.pdbLoaded:
-                    logger.warning(
-                        f"PDB not loaded for {program_name}. Manual loading might be required."
-                    )
+                    # The following is a placeholder for actual symbol loading logic
+                    pdb_attr = PdbProgramAttributes(program)
+                    if not pdb_attr.pdbLoaded:
+                        logger.warning(
+                            f"PDB not loaded for {program_name}. Manual loading might be required."
+                        )
 
-            except Exception as e:
-                logger.error(f"Failed to configure symbols for {program_name}: {e}")
+                except Exception as e:
+                    logger.error(f"Failed to configure symbols for {program_name}: {e}")
 
     def apply_gdt(
         self,
