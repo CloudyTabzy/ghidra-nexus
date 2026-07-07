@@ -307,7 +307,7 @@ class GhidraTools:
                 sig = None
                 status = "decompiled_empty"
             else:
-                code = decompiled.getC()
+                code = decompiled.getC().replace("\r\n", "\n")
                 sig = decompiled.getSignature()
                 status = "decompiled"
         else:

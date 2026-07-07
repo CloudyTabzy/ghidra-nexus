@@ -589,6 +589,18 @@ async def gen_callgraph(
 
 
 @mcp_error_handler
+async def analysis_status(ctx: Context) -> ProgramInfos:
+    """Show analysis progress for all binaries in the project.
+
+    Use this before calling decompile or search tools to check whether
+    each binary has finished Ghidra analysis and ChromaDB indexing.
+    'code_indexed' means semantic search is available.
+    """
+    pyghidra_context = _get_context(ctx)
+    return ProgramInfos(programs=pyghidra_context.list_project_binary_infos())
+
+
+@mcp_error_handler
 async def import_binary(binary_path: str, ctx: Context) -> ImportRequestResult:
     pyghidra_context = _get_context(ctx)
     return pyghidra_context.import_binary_backgrounded(binary_path)
