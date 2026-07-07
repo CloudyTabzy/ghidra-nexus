@@ -67,11 +67,12 @@ class GhidraExecutor:
         try:
             while self._running.is_set():
                 try:
-                    task_id, coro = await asyncio.wait_for(self._queue.get(), timeout=0.5)
+                    task_id, concurrent_future = await asyncio.wait_for(self._queue.get(), timeout=0.5)
                     with self._lock:
                         self._current_task_id = task_id
                         self._current_task_start = time.monotonic()
                     try:
+                        coro = asyncio.wrap_future(concurrent_future)
                         worker_task = asyncio.ensure_future(coro)
                         await asyncio.wait_for(worker_task, timeout=self._task_timeout)
                         self._tasks_completed += 1
