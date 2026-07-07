@@ -88,7 +88,7 @@ def register_gui_tools(server: FastMCP) -> None:
     server.tool()(mcp_tools.get_gui_context)
 
 
-register_common_tools(mcp)
+# Tools registered in main() based on transport mode
 
 
 def init_pyghidra_context(  # noqa: C901
@@ -275,7 +275,11 @@ def init_lazy_pyghidra_context(
                 ctx.analyze_project()
                 if wait_for_analysis:
                     ctx.schedule_startup_indexing(max_binaries=max(len(ctx.programs), 1))
-                else:
+    if transport in ("streamable-http", "http", "sse") and not (list_project_binaries or delete_project_binary):
+        # Lightweight startup — no JVM. wake_ghidra tool starts everything on demand.
+        mcp._pyghidra_context = PyGhidraContext.__new__(PyGhidraContext)  # type: ignore — placeholder
+
+    else:
                     for binary_name in imported:
                         ctx.schedule_indexing(binary_name)
             else:
@@ -538,6 +542,11 @@ def main(
     mcp.settings.port = port
     mcp.settings.host = host
 
+    if transport in ("streamable-http", "http", "sse") and not gui:
+        _register_lazy_tools(mcp)
+    else:
+        register_common_tools(mcp)
+
     if gui:
         if transport == "stdio":
             raise click.UsageError("--gui requires --transport streamable-http or --transport http")
@@ -654,27 +663,38 @@ def main(
         return
 
     else:
-        init_pyghidra_context(
-            mcp=mcp,
-            input_paths=input_paths,
-            transport=transport,
-            project_name=project_name,
-            project_directory=project_directory,
-            force_analysis=force_analysis,
-            verbose_analysis=verbose_analysis,
-            no_symbols=no_symbols,
-            gdts=list(gdt),
-            program_options_path=program_options,
-            gzfs_path=gzfs_path,
-            threaded=threaded,
-            max_workers=max_workers,
-            wait_for_analysis=wait_for_analysis,
-            list_project_binaries=list_project_binaries,
-            delete_project_binary=delete_project_binary,
-            pyghidra_mcp_dir=pyghidra_mcp_dir,
-            sym_file_path=sym_file_path,
-            symbols_path=symbols_path,
-        )
+        if transport in ("streamable-http", "http", "sse") and not (list_project_binaries or delete_project_binary):
+            # Lightweight — no JVM. wake_ghidra starts everything on demand.
+            class _Placeholder:
+                pass
+            ph = _Placeholder()
+            ph._mcp = mcp
+            ph.programs = {}
+            ph._pyghidra_context = None
+            mcp._pyghidra_context = ph  # type: ignore
+            mcp._ph = ph
+        else:
+            init_pyghidra_context(
+                mcp=mcp,
+                input_paths=input_paths,
+                transport=transport,
+                project_name=project_name,
+                project_directory=project_directory,
+                force_analysis=force_analysis,
+                verbose_analysis=verbose_analysis,
+                no_symbols=no_symbols,
+                gdts=list(gdt),
+                program_options_path=program_options,
+                gzfs_path=gzfs_path,
+                threaded=threaded,
+                max_workers=max_workers,
+                wait_for_analysis=wait_for_analysis,
+                list_project_binaries=list_project_binaries,
+                delete_project_binary=delete_project_binary,
+                pyghidra_mcp_dir=pyghidra_mcp_dir,
+                sym_file_path=sym_file_path,
+                symbols_path=symbols_path,
+            )
 
     try:
         run_mcp_server(mcp, transport)

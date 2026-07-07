@@ -761,3 +761,106 @@ async def save(ctx: Context) -> SaveRequestResult:
     pyghidra_context = _get_context(ctx)
     pyghidra_context.save()
     return SaveRequestResult()
+
+
+# ---- Lazy activation tools (for streamable-http daemon mode) ----
+
+_AWAKE = False
+_AWAKE_LOCK = threading.Lock()
+
+
+def _register_all_on_demand(mcp_server):
+    """Register all analysis tools on a FastMCP server dynamically."""
+    tools = [
+        (decompile_function, "decompile_function"),
+        (search_symbols_by_name, "search_symbols_by_name"),
+        (search_code, "search_code"),
+        (list_project_binaries, "list_project_binaries"),
+        (list_project_binary_metadata, "list_project_binary_metadata"),
+        (rename_function, "rename_function"),
+        (rename_variable, "rename_variable"),
+        (set_variable_type, "set_variable_type"),
+        (set_function_prototype, "set_function_prototype"),
+        (set_comment, "set_comment"),
+        (delete_project_binary, "delete_project_binary"),
+        (list_exports, "list_exports"),
+        (list_imports, "list_imports"),
+        (list_xrefs, "list_xrefs"),
+        (search_strings, "search_strings"),
+        (read_bytes, "read_bytes"),
+        (disassemble, "disassemble"),
+        (gen_callgraph, "gen_callgraph"),
+        (analysis_status, "analysis_status"),
+        (import_binary, "import_binary"),
+        (save, "save"),
+    ]
+    for fn, name in tools:
+        try:
+            mcp_server.add_tool(fn, name=name)
+        except Exception:
+            logger.warning("Failed to register tool %s", name, exc_info=True)
+    try:
+        mcp_server.remove_tool("wake_ghidra")
+    except Exception:
+        pass
+
+
+@mcp_error_handler
+async def wake_ghidra(ctx: Context) -> str:
+    """Start the Ghidra JVM and register all analysis tools.
+
+    Call this first in streamable-http daemon mode. The daemon starts
+    without loading Ghidra to save resources. This boots the JVM,
+    opens the project, and makes all analysis tools available.
+    """
+    global _AWAKE
+    with _AWAKE_LOCK:
+        if _AWAKE:
+            return "Ghidra is already awake."
+        _AWAKE = True
+
+    import time as _time
+    logger.info("wake_ghidra: starting Ghidra JVM...")
+    t0 = _time.time()
+
+    import pyghidra
+    pyghidra.start(False)
+
+    from pyghidra_mcp.context import PyGhidraContext
+    context = PyGhidraContext(
+        project_name="my_project",
+        project_path="C:/Dev/Ghidra-MCP/ghidra-projects",
+        threaded=True,
+        wait_for_analysis=False,
+    )
+    ctx.request_context.lifespan_context._pyghidra_context = context
+
+    from pyghidra_mcp.ghidra_executor import GhidraExecutor, set_executor as _se
+    executor = GhidraExecutor(max_queue_size=100, task_timeout=60.0)
+    executor.start()
+    _se(executor)
+
+    from pyghidra_mcp.watchdog import Watchdog, set_watchdog as _sw
+    wd = Watchdog(executor=executor, get_programs=lambda: context.programs)
+    wd.start()
+    _sw(wd)
+
+    ph = getattr(ctx.request_context.lifespan_context, "_ph", None)
+    if ph is not None:
+        ph._pyghidra_context = context
+    mcp_server = getattr(ph, "_mcp", None) if ph is not None else None
+    if mcp_server is not None:
+        _register_all_on_demand(mcp_server)
+
+    if len(context.list_binaries()) == 0:
+        logger.warning("No binaries in project. Use import_binary to add one.")
+
+    elapsed = _time.time() - t0
+    logger.info("wake_ghidra: ready in %.0fs", elapsed)
+    return f"Ghidra engine started in {elapsed:.0f}s. All analysis tools are now available."
+
+
+@mcp_error_handler
+async def ghidra_status(ctx: Context) -> str:
+    """Check whether Ghidra is awake and ready."""
+    return "awake" if _AWAKE else "asleep (call wake_ghidra to start)"
