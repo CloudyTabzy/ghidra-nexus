@@ -1,9 +1,11 @@
 # Server
 # ---------------------------------------------------------------------------------
+import asyncio
 import json
 import logging
 import sys
 import threading
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -20,7 +22,6 @@ from pyghidra_mcp.context_protocol import MCPContext
 from pyghidra_mcp.ghidra_executor import GhidraExecutor, set_executor
 from pyghidra_mcp.gui_context import GuiPyGhidraContext
 from pyghidra_mcp.gui_launcher import GuiPyGhidraMcpLauncher, ensure_macos_framework_python
-from pyghidra_mcp.lazy_context import LazyPyGhidraContext
 from pyghidra_mcp.project_spec import DEFAULT_PROJECT_NAME, ProjectSpec
 from pyghidra_mcp.watchdog import Watchdog, set_watchdog
 
@@ -589,9 +590,10 @@ def main(
         return
 
     if transport == "stdio" and not (list_project_binaries or delete_project_binary):
-        init_lazy_pyghidra_context(
+        init_pyghidra_context(
             mcp=mcp,
             input_paths=input_paths,
+            transport=transport,
             project_name=project_name,
             project_directory=project_directory,
             force_analysis=force_analysis,
@@ -603,10 +605,50 @@ def main(
             threaded=threaded,
             max_workers=max_workers,
             wait_for_analysis=wait_for_analysis,
+            list_project_binaries=list_project_binaries,
+            delete_project_binary=delete_project_binary,
             pyghidra_mcp_dir=pyghidra_mcp_dir,
-            symbols_path=symbols_path,
             sym_file_path=sym_file_path,
+            symbols_path=symbols_path,
         )
+        # RE-MCP pattern: FastMCP stdio on daemon thread, main thread
+        # runs the executor loop. This avoids JPype/JVM interference
+        # with FastMCP's asyncio stdio transport.
+        mcp_ready = threading.Event()
+        mcp_error: list[BaseException] = []
+
+        def _run_mcp():
+            try:
+                mcp_ready.set()
+                asyncio.run(mcp.run_stdio_async())
+            except BaseException as exc:
+                mcp_error.append(exc)
+                logger.exception("MCP stdio server failed")
+
+        mcp_thread = threading.Thread(target=_run_mcp, name="mcp-stdio", daemon=True)
+        mcp_thread.start()
+        if not mcp_ready.wait(timeout=5.0):
+            raise RuntimeError("MCP stdio server failed to start")
+
+        from pyghidra_mcp.ghidra_executor import get_executor as _ge
+        executor = _ge()
+        while mcp_thread.is_alive():
+            if mcp_error:
+                break
+            time.sleep(0.5)
+            stats = executor.stats
+            if stats.get("queue_depth", 0) > 50:
+                logger.warning("Executor queue congested: %s", stats)
+
+        from pyghidra_mcp.watchdog import get_watchdog as _gw
+        wd = _gw()
+        if wd is not None:
+            wd.stop()
+        if executor is not None:
+            executor.shutdown(timeout=5.0)
+        mcp._pyghidra_context.close()  # type: ignore
+        return
+
     else:
         init_pyghidra_context(
             mcp=mcp,
