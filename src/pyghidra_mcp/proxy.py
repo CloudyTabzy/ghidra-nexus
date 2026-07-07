@@ -229,7 +229,14 @@ def main() -> None:
                 continue
 
             if method == "initialize":
-                threading.Thread(target=_ensure_daemon, daemon=True).start()
+                sys.stderr.write("proxy: starting Ghidra daemon...\n")
+                sys.stderr.flush()
+                daemon_ready = _ensure_daemon()
+                sys.stderr.write(
+                    f"proxy: daemon {'ready' if daemon_ready else 'failed to start'}\n"
+                )
+                sys.stderr.flush()
+
                 response = {
                     "jsonrpc": "2.0",
                     "id": req_id,
@@ -244,7 +251,7 @@ def main() -> None:
                 }
                 stdout.write(json.dumps(response).encode("utf-8") + b"\n")
                 stdout.flush()
-                sys.stderr.write("proxy: -> initialize ok (daemon launching in bg)\n")
+                sys.stderr.write("proxy: -> initialize ok\n")
                 sys.stderr.flush()
                 continue
 
