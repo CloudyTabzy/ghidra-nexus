@@ -207,10 +207,14 @@ marimo/_lsp/
 __marimo__/
 
 
-pyghidra_mcp_projects/** 
+pyghidra_mcp_projects/**
 tests/pyghidra_mcp_projects/**
 src/pyghidra_mcp_projects/
+ghidra_nexus_projects/**
+tests/ghidra_nexus_projects/**
+src/ghidra_nexus_projects/
 chroma_test/
+notebook_test/
 
 # Personal
 ghidra

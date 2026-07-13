@@ -5,19 +5,19 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "pyghidra /bin/ls server",
+            "name": "ghidra-nexus /bin/ls server",
             "type": "debugpy",
             "request": "launch",
-            "program": "src/pyghidra_mcp/server.py",
+            "program": "src/ghidra_nexus/server.py",
             "console": "integratedTerminal",
             "justMyCode": false,
             "args": "/bin/ls"
         },
         {
-            "name": "pyghidra streamablehttp server",
+            "name": "ghidra-nexus streamable-http server",
             "type": "debugpy",
             "request": "launch",
-            "program": "src/pyghidra_mcp/server.py",
+            "program": "src/ghidra_nexus/server.py",
             "console": "integratedTerminal",
             "justMyCode": false,
             "args": "--transport streamable-http"

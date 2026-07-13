@@ -39,5 +39,5 @@ ENV MCP_HOST=0.0.0.0
 
 ENV GHIDRA_INSTALL_DIR="/ghidra"
 
-ENTRYPOINT ["pyghidra-mcp"]
+ENTRYPOINT ["ghidra-nexus"]
 CMD ["-t", "streamable-http"]
