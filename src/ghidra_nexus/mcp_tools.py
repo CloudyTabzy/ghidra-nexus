@@ -1,5 +1,5 @@
 """
-MCP Tool handlers for pyghidra-mcp.
+MCP Tool handlers for ghidra-nexus.
 
 All handlers are async and dispatch Ghidra work through the GhidraExecutor
 background thread for thread safety.
@@ -8,15 +8,16 @@ background thread for thread safety.
 import asyncio
 import functools
 import logging
+import threading
 from typing import Literal, cast
 
 from mcp.server.fastmcp import Context
 from mcp.shared.exceptions import McpError
 from mcp.types import INTERNAL_ERROR, INVALID_PARAMS, ErrorData
 
-from pyghidra_mcp.context_protocol import MCPContext
-from pyghidra_mcp.ghidra_executor import get_executor
-from pyghidra_mcp.models import (
+from ghidra_nexus.context_protocol import MCPContext
+from ghidra_nexus.ghidra_executor import get_executor
+from ghidra_nexus.models import (
     BytesReadResult,
     CallGraphDirection,
     CallGraphDisplayType,
@@ -44,14 +45,14 @@ from pyghidra_mcp.models import (
     VariableRenameResponse,
     VariableTypeResponse,
 )
-from pyghidra_mcp.tools import GhidraTools
-from pyghidra_mcp.watchdog import get_watchdog
+from ghidra_nexus.tools import GhidraTools
+from ghidra_nexus.watchdog import get_watchdog
 
 logger = logging.getLogger(__name__)
 
 
 def _require_gui_context(ctx: Context):
-    from pyghidra_mcp.gui_context import GuiPyGhidraContext
+    from ghidra_nexus.gui_context import GuiPyGhidraContext
 
     pyghidra_context = ctx.request_context.lifespan_context
     if pyghidra_context is None:
@@ -63,12 +64,12 @@ def _require_gui_context(ctx: Context):
             )
         )
     if not isinstance(pyghidra_context, GuiPyGhidraContext):
-        raise ValueError("This tool requires pyghidra-mcp to be running with --gui")
+        raise ValueError("This tool requires ghidra-nexus to be running with --gui")
     return pyghidra_context
 
 
 def _run_for_context(pyghidra_context: MCPContext, fn):
-    from pyghidra_mcp.gui_context import GuiPyGhidraContext
+    from ghidra_nexus.gui_context import GuiPyGhidraContext
 
     if isinstance(pyghidra_context, GuiPyGhidraContext):
         return pyghidra_context.run_on_swing(fn)
@@ -826,7 +827,7 @@ async def wake_ghidra(ctx: Context) -> str:
     import pyghidra
     pyghidra.start(False)
 
-    from pyghidra_mcp.context import PyGhidraContext
+    from ghidra_nexus.context import PyGhidraContext
     context = PyGhidraContext(
         project_name="my_project",
         project_path="C:/Dev/Ghidra-MCP/ghidra-projects",
@@ -835,12 +836,12 @@ async def wake_ghidra(ctx: Context) -> str:
     )
     ctx.request_context.lifespan_context._pyghidra_context = context
 
-    from pyghidra_mcp.ghidra_executor import GhidraExecutor, set_executor as _se
+    from ghidra_nexus.ghidra_executor import GhidraExecutor, set_executor as _se
     executor = GhidraExecutor(max_queue_size=100, task_timeout=60.0)
     executor.start()
     _se(executor)
 
-    from pyghidra_mcp.watchdog import Watchdog, set_watchdog as _sw
+    from ghidra_nexus.watchdog import Watchdog, set_watchdog as _sw
     wd = Watchdog(executor=executor, get_programs=lambda: context.programs)
     wd.start()
     _sw(wd)

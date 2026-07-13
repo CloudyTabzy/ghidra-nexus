@@ -17,7 +17,7 @@ import hashlib
 import re
 from collections import deque
 
-from pyghidra_mcp.models import (
+from ghidra_nexus.models import (
     SurveyCallGraphSummary,
     SurveyEntrypoint,
     SurveyImportEntry,

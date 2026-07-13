@@ -56,7 +56,7 @@ def _start_daemon() -> subprocess.Popen | None:
             [
                 sys.executable,
                 "-m",
-                "pyghidra_mcp",
+                "ghidra_nexus",
                 "--transport", "streamable-http",
                 "--host", DAEMON_HOST,
                 "--port", str(DAEMON_PORT),
@@ -83,12 +83,12 @@ def _ensure_daemon() -> bool:
         if _DAEMON_READY.is_set():
             return True
 
-        sys.stderr.write("pyghidra-mcp proxy: starting Ghidra daemon...\n")
+        sys.stderr.write("ghidra-nexus proxy: starting Ghidra daemon...\n")
         sys.stderr.flush()
 
         proc = _start_daemon()
         if proc is None:
-            sys.stderr.write("pyghidra-mcp proxy: failed to start daemon\n")
+            sys.stderr.write("ghidra-nexus proxy: failed to start daemon\n")
             sys.stderr.flush()
             return False
 
@@ -98,19 +98,19 @@ def _ensure_daemon() -> bool:
         while time.time() < deadline:
             if _is_daemon_running():
                 _DAEMON_READY.set()
-                sys.stderr.write("pyghidra-mcp proxy: daemon ready\n")
+                sys.stderr.write("ghidra-nexus proxy: daemon ready\n")
                 sys.stderr.flush()
                 return True
             if proc.poll() is not None:
                 sys.stderr.write(
-                    f"pyghidra-mcp proxy: daemon exited with code {proc.returncode}\n"
+                    f"ghidra-nexus proxy: daemon exited with code {proc.returncode}\n"
                 )
                 sys.stderr.flush()
                 return False
             time.sleep(1.0)
 
         sys.stderr.write(
-            f"pyghidra-mcp proxy: daemon timed out after {DAEMON_STARTUP_TIMEOUT}s\n"
+            f"ghidra-nexus proxy: daemon timed out after {DAEMON_STARTUP_TIMEOUT}s\n"
         )
         sys.stderr.flush()
         return False
@@ -173,7 +173,7 @@ def main() -> None:
     stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
 
-    sys.stderr.write(f"pyghidra-mcp proxy: started on port {DAEMON_PORT}, pid={os.getpid()}\n")
+    sys.stderr.write(f"ghidra-nexus proxy: started on port {DAEMON_PORT}, pid={os.getpid()}\n")
     sys.stderr.flush()
 
     signal.signal(signal.SIGINT, lambda *_: _cleanup() or sys.exit(0))
@@ -244,7 +244,7 @@ def main() -> None:
                         "protocolVersion": "2025-06-18",
                         "capabilities": {"tools": {}},
                         "serverInfo": {
-                            "name": "pyghidra-mcp-proxy",
+                            "name": "ghidra-nexus-proxy",
                             "version": "0.2.3",
                         },
                     },

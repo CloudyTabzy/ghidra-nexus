@@ -1,4 +1,4 @@
-from pyghidra_mcp.server import main
+from ghidra_nexus.server import main
 
 if __name__ == "__main__":
     main()

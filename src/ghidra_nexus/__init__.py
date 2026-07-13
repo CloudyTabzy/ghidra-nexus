@@ -1,5 +1,7 @@
-__version__ = "0.2.3"
-__author__ = "clearbluejar"
+__version__ = "0.3.0"
+__author__ = "CloudyTabzy"
+__project__ = "GhidraNexus"
+__description__ = "Agent-first Ghidra MCP server with a persistent notebook."
 
 
 def main() -> None:
@@ -25,7 +27,11 @@ def __getattr__(name: str):
         from .tools import GhidraTools
 
         return GhidraTools
+    if name == "Notebook":
+        from .notebook import Notebook
+
+        return Notebook
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-__all__ = ["GhidraTools", "ProgramInfo", "PyGhidraContext", "main", "server"]
+__all__ = ["GhidraTools", "ProgramInfo", "PyGhidraContext", "Notebook", "main", "server"]

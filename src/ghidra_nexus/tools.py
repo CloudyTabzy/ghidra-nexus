@@ -1,5 +1,5 @@
 """
-Comprehensive tool implementations for pyghidra-mcp.
+Comprehensive tool implementations for ghidra-nexus.
 """
 
 import functools
@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from ghidrecomp.callgraph import gen_callgraph
 from jpype import JByte
 
-from pyghidra_mcp.models import (
+from ghidra_nexus.models import (
     BytesReadResult,
     CallGraphDirection,
     CallGraphDisplayType,
@@ -419,7 +419,7 @@ class GhidraTools:
         binary and wants to know "is this interesting enough to decompile?"
         before committing to a 5-10 minute analysis wait.
         """
-        from pyghidra_mcp import api_survey
+        from ghidra_nexus import api_survey
 
         raw = api_survey.survey_binary_fast(self.program)
         return SurveyBinaryResult.model_validate(raw)
@@ -450,7 +450,7 @@ class GhidraTools:
             — use for very large binaries where the full payload would
             block the executor thread.
         """
-        from pyghidra_mcp import api_survey
+        from ghidra_nexus import api_survey
 
         if detail_level not in ("standard", "minimal"):
             raise ValueError("detail_level must be 'standard' or 'minimal'")
@@ -1055,7 +1055,7 @@ class GhidraTools:
 
         with ghidra_transaction(
             self.program,
-            f"pyghidra-mcp: rename {old_name} -> {new_name}",
+            f"nexus: rename {old_name} -> {new_name}",
         ):
             func.setName(new_name, SourceType.USER_DEFINED)
 
@@ -1083,7 +1083,7 @@ class GhidraTools:
         function_address = str(func.getEntryPoint())
         with ghidra_transaction(
             self.program,
-            f"pyghidra-mcp: rename {variable_kind} {old_name} -> {new_name}",
+            f"nexus: rename {variable_kind} {old_name} -> {new_name}",
         ):
             variable.setName(new_name, SourceType.USER_DEFINED)
 
@@ -1115,7 +1115,7 @@ class GhidraTools:
 
         with ghidra_transaction(
             self.program,
-            f"pyghidra-mcp: set {variable_kind} type {variable_name} -> {type_name}",
+            f"nexus: set {variable_kind} type {variable_name} -> {type_name}",
         ):
             variable.setDataType(data_type, SourceType.USER_DEFINED)
 
@@ -1157,7 +1157,7 @@ class GhidraTools:
 
         with ghidra_transaction(
             self.program,
-            f"pyghidra-mcp: set function prototype {function_name}",
+            f"nexus: set function prototype {function_name}",
         ):
             if not cmd.applyTo(self.program, TaskMonitor.DUMMY):
                 message = cmd.getStatusMsg() or f"Failed to apply function prototype: {prototype}"
@@ -1201,7 +1201,7 @@ class GhidraTools:
 
             with ghidra_transaction(
                 self.program,
-                f"pyghidra-mcp: set function comment @ {addr}",
+                f"nexus: set function comment @ {addr}",
             ):
                 func.setComment(comment)
 
@@ -1220,7 +1220,7 @@ class GhidraTools:
         addr = self._resolve_comment_target_address(target)
         with ghidra_transaction(
             self.program,
-            f"pyghidra-mcp: set {normalized_type} comment @ {addr}",
+            f"nexus: set {normalized_type} comment @ {addr}",
         ):
             self.program.getListing().setComment(addr, ghidra_comment_type, comment)
 

@@ -11,7 +11,7 @@ class ProjectSpec:
     project_directory: Path
     project_name: str
     gpr_path: Path
-    pyghidra_mcp_dir: Path
+    nexus_data_dir: Path
     was_gpr_path: bool
 
     @classmethod
@@ -35,7 +35,7 @@ class ProjectSpec:
                 project_directory=project_directory,
                 project_name=resolved_project_name,
                 gpr_path=project_path,
-                pyghidra_mcp_dir=project_directory / f"{resolved_project_name}-pyghidra-mcp",
+                nexus_data_dir=project_directory / f"{resolved_project_name}-ghidra-nexus",
                 was_gpr_path=True,
             )
 
@@ -43,6 +43,6 @@ class ProjectSpec:
             project_directory=project_path,
             project_name=project_name,
             gpr_path=project_path / f"{project_name}.gpr",
-            pyghidra_mcp_dir=project_path / f"{project_name}-pyghidra-mcp",
+            nexus_data_dir=project_path / f"{project_name}-ghidra-nexus",
             was_gpr_path=False,
         )

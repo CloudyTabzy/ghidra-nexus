@@ -1,7 +1,7 @@
 [project]
-name = "pyghidra-mcp"
-version = "0.2.3"
-description = "Python Command-Line Ghidra MCP"
+name = "ghidra-nexus"
+version = "0.3.0"
+description = "Agent-first Ghidra MCP server with a persistent notebook — built for long-horizon reverse engineering"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -13,17 +13,18 @@ dependencies = [
     "ghidrecomp>=0.5.8",
 ]
 authors = [
-    { name = "clearbluejar", email = "3752074+clearbluejar@users.noreply.github.com" },
-    { name = "notoriousrip", email = "3935212+unimpossible@users.noreply.github.com" },
+    { name = "CloudyTabzy" },
 ]
 keywords = [
     "security",
     "dynamic-analysis",
     "static-analysis",
-    "pyghidra",
     "ghidra",
+    "pyghidra",
     "mcp",
-    "reverse-engineering"
+    "reverse-engineering",
+    "agent",
+    "notebook",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -35,6 +36,8 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Security",
 ]
+urls.Homepage = "https://github.com/CloudyTabzy/ghidra-nexus"
+urls.Issues = "https://github.com/CloudyTabzy/ghidra-nexus/issues"
 
 [build-system]
 requires = ["hatchling"]
@@ -47,7 +50,6 @@ dev = [
     "aiohttp",
     "pytest-cov>=6.2.1",
     "ghidra-stubs>=11.3.2",
-    "pytest-cov>=6.2.1",
     "mcp[cli]>=1.26.0",
     "ruff>=0.11.4",
     "tomli>=2.0.1",
@@ -65,7 +67,6 @@ dev = [
     "aiohttp",
     "pytest-cov>=6.2.1",
     "ghidra-stubs>=11.3.2",
-    "pytest-cov>=6.2.1",
     "mcp[cli]>=1.26.0",
     "ruff>=0.11.4",
     "tomli>=2.0.1",
@@ -76,12 +77,12 @@ dev = [
 ]
 
 [project.scripts]
-pyghidra-mcp = "pyghidra_mcp.server:main"
-pyghidra-mcp-proxy = "pyghidra_mcp.proxy:main"
+ghidra-nexus = "ghidra_nexus.server:main"
+ghidra-nexus-proxy = "ghidra_nexus.proxy:main"
 
 [tool.hatch.build]
 include = [
-    "src/pyghidra_mcp",
+    "src/ghidra_nexus",
 ]
 
 [tool.setuptools.packages.find]
@@ -89,7 +90,7 @@ where = ["src"]
 
 [tool.hatch.build.targets.wheel]
 packages = [
-    "src/pyghidra_mcp",
+    "src/ghidra_nexus",
 ]
 
 [tool.ruff]
@@ -118,7 +119,7 @@ ignore = ["F821", "E402"]
 
 
 [tool.ruff.lint.isort]
-known-first-party = ["pyghidra_mcp"]
+known-first-party = ["ghidra_nexus"]
 known-third-party = ["ghidra", "ghidrecomp", "java", "jpype"]
 
 combine-as-imports = true

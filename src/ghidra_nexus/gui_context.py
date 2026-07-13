@@ -7,17 +7,17 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from pyghidra_mcp.context import ProgramInfo
-from pyghidra_mcp.decompiler_pool import DecompilerPool
-from pyghidra_mcp.import_detection import is_ghidra_importable
-from pyghidra_mcp.import_planning import ImportCandidate, build_import_plan
-from pyghidra_mcp.indexing_mixin import IndexingMixin
-from pyghidra_mcp.models import (
+from ghidra_nexus.context import ProgramInfo
+from ghidra_nexus.decompiler_pool import DecompilerPool
+from ghidra_nexus.import_detection import is_ghidra_importable
+from ghidra_nexus.import_planning import ImportCandidate, build_import_plan
+from ghidra_nexus.indexing_mixin import IndexingMixin
+from ghidra_nexus.models import (
     ImportRequestResult,
     ProgramInfo as ProgramInfoModel,
     SkippedImport as SkippedImportModel,
 )
-from pyghidra_mcp.project_spec import ProjectSpec
+from ghidra_nexus.project_spec import ProjectSpec
 
 logger = logging.getLogger(__name__)
 
@@ -74,18 +74,18 @@ class GuiPyGhidraContext(IndexingMixin):
         self,
         project_spec: ProjectSpec,
         *,
-        pyghidra_mcp_dir: Path | None = None,
+        nexus_data_dir: Path | None = None,
         readiness_timeout: float = 240.0,
         readiness_interval: float = 0.2,
     ):
         self.project_spec = project_spec
         self.project_name = project_spec.project_name
         self.project_path = project_spec.project_directory
-        self.pyghidra_mcp_dir = pyghidra_mcp_dir or project_spec.pyghidra_mcp_dir
+        self.nexus_data_dir = nexus_data_dir or project_spec.nexus_data_dir
         self.programs: dict[str, ProgramInfo] = {}
         self._programs_lock = threading.RLock()
         self.import_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        self._init_indexing_state(self.pyghidra_mcp_dir, threaded=True)
+        self._init_indexing_state(self.nexus_data_dir, threaded=True)
 
         self.project = self.wait_for_gui_ready(
             project_spec,
@@ -351,7 +351,7 @@ class GuiPyGhidraContext(IndexingMixin):
         program_info = self._resolve_program_info(binary_name)
 
         if normalized_type == "function":
-            from pyghidra_mcp.tools import GhidraTools
+            from ghidra_nexus.tools import GhidraTools
 
             function = GhidraTools(program_info).find_function(target)
             address_obj = function.getEntryPoint()
@@ -616,7 +616,7 @@ class GuiPyGhidraContext(IndexingMixin):
         from ghidra.util.task import TaskMonitor
         from java.io import File  # type: ignore
 
-        from pyghidra_mcp.context import PyGhidraContext
+        from ghidra_nexus.context import PyGhidraContext
 
         binary_path = Path(binary_path)
         if binary_path.is_dir():
@@ -722,7 +722,7 @@ class GuiPyGhidraContext(IndexingMixin):
         try:
             prompt_flag_changed = self._mark_program_not_to_ask_to_analyze(program)
             if opened_here and prompt_flag_changed:
-                program.save("pyghidra-mcp: suppress GUI analysis prompt", TaskMonitor.DUMMY)
+                program.save("nexus: suppress GUI analysis prompt", TaskMonitor.DUMMY)
         except Exception:
             program.release(consumer)
             raise

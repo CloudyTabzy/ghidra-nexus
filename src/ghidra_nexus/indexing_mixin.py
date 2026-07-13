@@ -7,14 +7,14 @@ from typing import Any
 import chromadb
 from chromadb.config import Settings
 
-from pyghidra_mcp.tools import GhidraTools
+from ghidra_nexus.tools import GhidraTools
 
 logger = logging.getLogger(__name__)
 
 # Collection metadata key flipped to True only after a code index is fully
 # populated. A collection missing this marker (legacy) or carrying False (an
 # interrupted/partial index) is rebuilt rather than trusted on restart.
-COLLECTION_COMPLETE_KEY = "pyghidra_index_complete"
+COLLECTION_COMPLETE_KEY = "nexus_index_complete"
 
 
 class IndexingMixin:
@@ -22,8 +22,8 @@ class IndexingMixin:
 
     programs: dict[str, Any]
 
-    def _init_indexing_state(self, pyghidra_mcp_dir: Path, *, threaded: bool) -> None:
-        chromadb_path = pyghidra_mcp_dir / "chromadb"
+    def _init_indexing_state(self, nexus_data_dir: Path, *, threaded: bool) -> None:
+        chromadb_path = nexus_data_dir / "chromadb"
         chromadb_path.mkdir(parents=True, exist_ok=True)
         try:
             self.chroma_client = chromadb.PersistentClient(

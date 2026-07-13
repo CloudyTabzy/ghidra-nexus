@@ -2,7 +2,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
-from pyghidra_mcp.import_detection import is_ghidra_importable
+from ghidra_nexus.import_detection import is_ghidra_importable
 
 ARCHIVE_SUFFIXES = (
     ".zip",

@@ -50,7 +50,7 @@ async def _start_daemon() -> subprocess.Popen | None:
             [
                 sys.executable,
                 "-m",
-                "pyghidra_mcp",
+                "ghidra_nexus",
                 "--transport", "streamable-http",
                 "--host", _DAEMON_HOST,
                 "--port", str(_DAEMON_PORT),

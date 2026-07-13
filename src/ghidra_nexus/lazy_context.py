@@ -10,11 +10,11 @@ import logging
 import threading
 from typing import TYPE_CHECKING, Any
 
-from pyghidra_mcp.context_protocol import MCPContext
-from pyghidra_mcp.models import ImportRequestResult, ProgramInfo as ProgramInfoModel
+from ghidra_nexus.context_protocol import MCPContext
+from ghidra_nexus.models import ImportRequestResult, ProgramInfo as ProgramInfoModel
 
 if TYPE_CHECKING:
-    from pyghidra_mcp.context import ProgramInfo, PyGhidraContext
+    from ghidra_nexus.context import ProgramInfo, PyGhidraContext
 
 logger = logging.getLogger(__name__)
 

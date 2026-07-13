@@ -5,7 +5,7 @@ from collections import deque
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from pyghidra_mcp.ghidra_executor import GhidraExecutor
+    from ghidra_nexus.ghidra_executor import GhidraExecutor
 
 logger = logging.getLogger(__name__)
 

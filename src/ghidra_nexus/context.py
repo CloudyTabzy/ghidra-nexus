@@ -10,11 +10,11 @@ from typing import TYPE_CHECKING, Any, Union
 
 import chromadb
 
-from pyghidra_mcp.decompiler_pool import DecompilerPool
-from pyghidra_mcp.import_detection import is_ghidra_importable
-from pyghidra_mcp.import_planning import ImportCandidate, build_import_plan
-from pyghidra_mcp.indexing_mixin import IndexingMixin
-from pyghidra_mcp.models import (
+from ghidra_nexus.decompiler_pool import DecompilerPool
+from ghidra_nexus.import_detection import is_ghidra_importable
+from ghidra_nexus.import_planning import ImportCandidate, build_import_plan
+from ghidra_nexus.indexing_mixin import IndexingMixin
+from ghidra_nexus.models import (
     ImportRequestResult,
     ProgramInfo as ProgramInfoModel,
     SkippedImport as SkippedImportModel,
@@ -66,7 +66,7 @@ class PyGhidraContext(IndexingMixin):
         self,
         project_name: str,
         project_path: str | Path,
-        pyghidra_mcp_dir: Path | None = None,
+        nexus_data_dir: Path | None = None,
         force_analysis: bool = False,
         verbose_analysis: bool = False,
         no_symbols: bool = False,
@@ -103,12 +103,12 @@ class PyGhidraContext(IndexingMixin):
         self.project_path = Path(project_path)
         self.project: GhidraProject = self._get_or_create_project()
 
-        # Use provided pyghidra-mcp directory or create default
-        if pyghidra_mcp_dir:
-            self.pyghidra_mcp_dir = pyghidra_mcp_dir
+        # Use provided ghidra-nexus directory or create default
+        if nexus_data_dir:
+            self.nexus_data_dir = nexus_data_dir
         else:
-            # Default: create pyghidra-mcp directory alongside project
-            self.pyghidra_mcp_dir = self.project_path / "pyghidra-mcp"
+            # Default: create ghidra-nexus directory alongside project
+            self.nexus_data_dir = self.project_path / "ghidra-nexus"
 
         # From GhidraDiffEngine
         self.force_analysis = force_analysis
@@ -118,11 +118,11 @@ class PyGhidraContext(IndexingMixin):
 
         # Symbol configuration
         self.symbols_path = (
-            Path(symbols_path) if symbols_path else self.pyghidra_mcp_dir / "symbols"
+            Path(symbols_path) if symbols_path else self.nexus_data_dir / "symbols"
         )
         self.sym_file_path = Path(sym_file_path) if sym_file_path else None
         self.program_options = program_options
-        self.gzfs_path = Path(gzfs_path) if gzfs_path else self.pyghidra_mcp_dir / "gzfs"
+        self.gzfs_path = Path(gzfs_path) if gzfs_path else self.nexus_data_dir / "gzfs"
         if self.gzfs_path:
             self.gzfs_path.mkdir(exist_ok=True, parents=True)
 
@@ -133,7 +133,7 @@ class PyGhidraContext(IndexingMixin):
         if not self.threaded:
             logger.warning("--no-threaded flag forcing max_workers to 1")
             self.max_workers = 1
-        self._init_indexing_state(self.pyghidra_mcp_dir, threaded=self.threaded)
+        self._init_indexing_state(self.nexus_data_dir, threaded=self.threaded)
         self.executor = (
             concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers)
             if self.threaded

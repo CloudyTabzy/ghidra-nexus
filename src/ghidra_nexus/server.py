@@ -16,14 +16,14 @@ from click_option_group import optgroup
 from mcp.server import Server
 from mcp.server.fastmcp import FastMCP
 
-from pyghidra_mcp import __version__, mcp_tools
-from pyghidra_mcp.context import PyGhidraContext
-from pyghidra_mcp.context_protocol import MCPContext
-from pyghidra_mcp.ghidra_executor import GhidraExecutor, set_executor
-from pyghidra_mcp.gui_context import GuiPyGhidraContext
-from pyghidra_mcp.gui_launcher import GuiPyGhidraMcpLauncher, ensure_macos_framework_python
-from pyghidra_mcp.project_spec import DEFAULT_PROJECT_NAME, ProjectSpec
-from pyghidra_mcp.watchdog import Watchdog, set_watchdog
+from ghidra_nexus import __version__, mcp_tools
+from ghidra_nexus.context import PyGhidraContext
+from ghidra_nexus.context_protocol import MCPContext
+from ghidra_nexus.ghidra_executor import GhidraExecutor, set_executor
+from ghidra_nexus.gui_context import GuiPyGhidraContext
+from ghidra_nexus.gui_launcher import GuiPyGhidraMcpLauncher, ensure_macos_framework_python
+from ghidra_nexus.project_spec import DEFAULT_PROJECT_NAME, ProjectSpec
+from ghidra_nexus.watchdog import Watchdog, set_watchdog
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,7 +50,7 @@ async def server_lifespan(server: Server) -> AsyncIterator[MCPContext]:
             context.close()
 
 
-mcp = FastMCP("pyghidra-mcp", lifespan=server_lifespan)  # type: ignore
+mcp = FastMCP("ghidra-nexus", lifespan=server_lifespan)  # type: ignore
 
 
 def register_common_tools(server: FastMCP) -> None:
@@ -98,7 +98,7 @@ def init_pyghidra_context(  # noqa: C901
     input_paths: list[Path],
     project_name: str,
     project_directory: str,
-    pyghidra_mcp_dir: Path,
+    nexus_data_dir: Path,
     force_analysis: bool,
     verbose_analysis: bool,
     no_symbols: bool,
@@ -130,7 +130,7 @@ def init_pyghidra_context(  # noqa: C901
     pyghidra_context = PyGhidraContext(
         project_name=project_name,
         project_path=project_directory,
-        pyghidra_mcp_dir=pyghidra_mcp_dir,
+        nexus_data_dir=nexus_data_dir,
         force_analysis=force_analysis,
         verbose_analysis=verbose_analysis,
         no_symbols=no_symbols,
@@ -308,7 +308,7 @@ def run_mcp_server(mcp: FastMCP, transport: str) -> None:
     type=click.Path(path_type=Path),
     default=Path("C:/Dev/Ghidra-MCP/ghidra-projects"),
     show_default=True,
-    help="Directory path to create new pyghidra-mcp project or an existing Ghidra .gpr file.",
+    help="Directory path to create new ghidra-nexus project or an existing Ghidra .gpr file.",
 )
 @optgroup.option(
     "--project-name",
@@ -432,7 +432,7 @@ def main(
 ) -> None:
     """PyGhidra Command-Line MCP server
 
-    - input_paths: Path to one or more binaries to import, analyze, and expose with pyghidra-mcp\n
+    - input_paths: Path to one or more binaries to import, analyze, and expose with ghidra-nexus\n
     - transport: Supports stdio, streamable-http, and sse transports.\n
     For stdio, it will read from stdin and write to stdout.
     For streamable-http and sse, it will start an HTTP server on the specified port (default 8000).
@@ -449,7 +449,7 @@ def main(
 
     project_directory = str(project_spec.project_directory)
     project_name = project_spec.project_name
-    pyghidra_mcp_dir = project_spec.pyghidra_mcp_dir
+    nexus_data_dir = project_spec.nexus_data_dir
     mcp.settings.port = port
     mcp.settings.host = host
 
@@ -483,7 +483,7 @@ def main(
 
         server_thread = threading.Thread(
             target=gui_server_thread,
-            name="pyghidra-mcp-gui-server",
+            name="ghidra-nexus-gui-server",
             daemon=True,
         )
         server_thread.start()
@@ -492,8 +492,8 @@ def main(
         finally:
             launcher.request_shutdown()
             launcher.wait_for_shutdown()
-            from pyghidra_mcp.ghidra_executor import get_executor as _ge
-            from pyghidra_mcp.watchdog import get_watchdog as _gw
+            from ghidra_nexus.ghidra_executor import get_executor as _ge
+            from ghidra_nexus.watchdog import get_watchdog as _gw
             wd = _gw()
             if wd is not None:
                 wd.stop()
@@ -531,7 +531,7 @@ def main(
             wait_for_analysis=wait_for_analysis,
             list_project_binaries=list_project_binaries,
             delete_project_binary=delete_project_binary,
-            pyghidra_mcp_dir=pyghidra_mcp_dir,
+            nexus_data_dir=nexus_data_dir,
             sym_file_path=sym_file_path,
             symbols_path=symbols_path,
         )
@@ -554,7 +554,7 @@ def main(
         if not mcp_ready.wait(timeout=5.0):
             raise RuntimeError("MCP stdio server failed to start")
 
-        from pyghidra_mcp.ghidra_executor import get_executor as _ge
+        from ghidra_nexus.ghidra_executor import get_executor as _ge
         executor = _ge()
         while mcp_thread.is_alive():
             if mcp_error:
@@ -564,7 +564,7 @@ def main(
             if stats.get("queue_depth", 0) > 50:
                 logger.warning("Executor queue congested: %s", stats)
 
-        from pyghidra_mcp.watchdog import get_watchdog as _gw
+        from ghidra_nexus.watchdog import get_watchdog as _gw
         wd = _gw()
         if wd is not None:
             wd.stop()
@@ -602,7 +602,7 @@ def main(
                 wait_for_analysis=wait_for_analysis,
                 list_project_binaries=list_project_binaries,
                 delete_project_binary=delete_project_binary,
-                pyghidra_mcp_dir=pyghidra_mcp_dir,
+                nexus_data_dir=nexus_data_dir,
                 sym_file_path=sym_file_path,
                 symbols_path=symbols_path,
             )
@@ -610,8 +610,8 @@ def main(
     try:
         run_mcp_server(mcp, transport)
     finally:
-        from pyghidra_mcp.ghidra_executor import get_executor as _ge
-        from pyghidra_mcp.watchdog import get_watchdog as _gw
+        from ghidra_nexus.ghidra_executor import get_executor as _ge
+        from ghidra_nexus.watchdog import get_watchdog as _gw
 
         wd = _gw()
         if wd is not None:

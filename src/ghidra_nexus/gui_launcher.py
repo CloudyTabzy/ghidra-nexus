@@ -36,7 +36,7 @@ def ensure_macos_framework_python() -> None:
     env[REEXEC_ENV] = "1"
     os.execve(
         str(framework_python),
-        [sys.executable, "-m", "pyghidra_mcp", *sys.argv[1:]],
+        [sys.executable, "-m", "ghidra_nexus", *sys.argv[1:]],
         env,
     )
 
