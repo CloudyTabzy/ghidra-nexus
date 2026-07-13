@@ -3,7 +3,7 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from pyghidra_mcp.tools import GhidraTools
+from ghidra_nexus.tools import GhidraTools
 
 
 def _make_tools():
@@ -25,7 +25,7 @@ def test_set_comment_resolves_symbol_target(monkeypatch):
     tools = _make_tools()
     _install_listing_module(monkeypatch)
     monkeypatch.setattr(
-        "pyghidra_mcp.tools.ghidra_transaction",
+        "ghidra_nexus.tools.ghidra_transaction",
         lambda *_args, **_kwargs: nullcontext(),
     )
 
@@ -49,7 +49,7 @@ def test_set_comment_resolves_decimal_address(monkeypatch):
     tools = _make_tools()
     _install_listing_module(monkeypatch)
     monkeypatch.setattr(
-        "pyghidra_mcp.tools.ghidra_transaction",
+        "ghidra_nexus.tools.ghidra_transaction",
         lambda *_args, **_kwargs: nullcontext(),
     )
 

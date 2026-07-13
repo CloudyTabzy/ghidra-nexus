@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from ghidrecomp.callgraph import gen_callgraph
 from jpype import JByte
 
+from ghidra_nexus.errors import ToolErrorCode, classify_decompile_failure, make_tool_error
 from ghidra_nexus.models import (
     BytesReadResult,
     CallGraphDirection,
@@ -24,11 +25,13 @@ from ghidra_nexus.models import (
     ExportInfo,
     ImportInfo,
     SearchMode,
+    SectionHealth,
     StringInfo,
     StringSearchResult,
     SurveyBinaryResult,
     SymbolInfo,
 )
+from ghidra_nexus.section_entropy import classify_section, shannon_entropy, summarize_section_classifications
 
 _REGEX_META = re.compile(r"[\\^$.|?*+(){}\[\]]")
 
@@ -295,12 +298,19 @@ class GhidraTools:
         return self.decompile_function(func, timeout=timeout)
 
     def decompile_function(self, func: "Function", timeout: int = 0) -> DecompiledFunction:
-        """Decompiles a function in a specified binary and returns its pseudo-C code."""
+        """Decompiles a function in a specified binary and returns its pseudo-C code.
+
+        Phase 0.5: on failure, sets ``error_code`` (stable string from
+        :class:`ToolErrorCode`) and ``hint`` so the agent can branch on it
+        without parsing free-text error messages. See ``errors.py``.
+        """
         from ghidra.util.task import ConsoleTaskMonitor
 
         monitor = ConsoleTaskMonitor()
         with self.decompiler_pool.acquire() as decompiler:
             result: DecompileResults = decompiler.decompileFunction(func, timeout, monitor)
+        error_code: str | None = None
+        hint: str | None = None
         if "" == result.getErrorMessage():
             decompiled = result.getDecompiledFunction()
             if decompiled is None:
@@ -312,11 +322,26 @@ class GhidraTools:
                 sig = decompiled.getSignature()
                 status = "decompiled"
         else:
-            code = result.getErrorMessage()
+            error_msg = result.getErrorMessage()
+            code = error_msg
             sig = None
             status = "decompiler_error"
+            # Map the Ghidra error string to a stable code.
+            code_enum = classify_decompile_failure(error_msg)
+            error_code = code_enum.value
+            err = make_tool_error(
+                code_enum,
+                error_msg,
+                binary_name=self.program.getName() if self.program else None,
+            )
+            hint = err.get("hint")
         return DecompiledFunction(
-            name=self._get_filename(func), code=code, signature=sig, decompiler_status=status
+            name=self._get_filename(func),
+            code=code,
+            signature=sig,
+            decompiler_status=status,
+            error_code=error_code,
+            hint=hint,
         )
 
     @handle_exceptions
@@ -457,6 +482,79 @@ class GhidraTools:
 
         raw = api_survey.survey_binary(self.program, detail_level=detail_level)
         return SurveyBinaryResult.model_validate(raw)
+
+    @handle_exceptions
+    def section_health(self, max_size_bytes: int = 4 * 1024 * 1024) -> list[SectionHealth]:
+        """Per-section entropy + classification + agent recommendation.
+
+        Computes Shannon entropy for each initialised memory block (subsampled
+        to ``max_size_bytes`` for huge blocks like Affinity's 309 MB ``.text``)
+        and returns a flat list of :class:`SectionHealth`. Cheap to call on
+        any binary.
+
+        Use this as the **first** call after ``analysis_status`` reports
+        complete: it surfaces encrypted/packed sections in one shot, saving
+        a ``Get-ChildItem`` round trip and three ``decompile_function`` calls
+        that were going to fail anyway.
+        """
+        from ghidra_nexus.models import SectionClassification, SectionRecommendation
+
+        blocks = list(self.program.getMemory().getBlocks())
+        memory = self.program.getMemory()
+        results: list[SectionHealth] = []
+
+        for block in blocks:
+            try:
+                name = block.getName() or ""
+                start = block.getStart()
+                end = block.getEnd()
+                size = int(block.getSize())
+                try:
+                    is_r = bool(block.isRead())
+                except Exception:
+                    is_r = False
+                try:
+                    is_w = bool(block.isWrite())
+                except Exception:
+                    is_w = False
+                try:
+                    is_x = bool(block.isExecute())
+                except Exception:
+                    is_x = False
+                perms = ("r" if is_r else "-") + ("w" if is_w else "-") + ("x" if is_x else "-")
+
+                entropy_val: float | None = None
+                sample = min(size, max_size_bytes)
+                if sample > 0:
+                    try:
+                        raw = memory.getBytes(start, sample)
+                        if raw is not None and len(raw) > 0:
+                            entropy_val = shannon_entropy(bytes(raw))
+                    except Exception:
+                        entropy_val = None
+
+                classification, recommendation, reason = classify_section(
+                    entropy_val if entropy_val is not None else 0.0,
+                    size,
+                    is_executable=is_x,
+                )
+
+                results.append(
+                    SectionHealth(
+                        name=name,
+                        start=str(start),
+                        end=str(end),
+                        size_bytes=size,
+                        entropy=entropy_val if entropy_val is not None else 0.0,
+                        classification=classification,
+                        recommendation=recommendation,
+                        reason=reason,
+                        permissions=perms,
+                    )
+                )
+            except Exception:
+                continue
+        return results
 
     @staticmethod
     def _matches_query(query: str, symbol_name: str) -> bool:

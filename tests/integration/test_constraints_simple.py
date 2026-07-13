@@ -16,7 +16,7 @@ def test_gpr_constraint_validation(ghidra_env):
             [
                 sys.executable,
                 "-m",
-                "pyghidra_mcp",
+                "ghidra_nexus",
                 "--project-path",
                 str(gpr_path),
                 "--project-name",
@@ -57,7 +57,7 @@ def test_project_name_default_value():
     """Test that default project name is 'my_project'"""
     import click.testing
 
-    from pyghidra_mcp.server import main
+    from ghidra_nexus.server import main
 
     runner = click.testing.CliRunner()
     result = runner.invoke(main, ["--help"])
@@ -71,7 +71,7 @@ def test_gpr_help_text_updated():
     """Test that help text reflects .gpr constraint"""
     import click.testing
 
-    from pyghidra_mcp.server import main
+    from ghidra_nexus.server import main
 
     runner = click.testing.CliRunner()
     result = runner.invoke(main, ["--help"])

@@ -2,8 +2,8 @@ import pytest
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client
 
-from pyghidra_mcp.context import PyGhidraContext
-from pyghidra_mcp.models import SymbolSearchResults
+from ghidra_nexus.context import PyGhidraContext
+from ghidra_nexus.models import SymbolSearchResults
 
 
 @pytest.mark.asyncio

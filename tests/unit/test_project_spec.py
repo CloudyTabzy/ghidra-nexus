@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from pyghidra_mcp.project_spec import DEFAULT_PROJECT_NAME, ProjectSpec
+from ghidra_nexus.project_spec import DEFAULT_PROJECT_NAME, ProjectSpec
 
 
 def test_project_spec_from_gpr_path():
@@ -12,7 +12,7 @@ def test_project_spec_from_gpr_path():
     assert spec.project_directory == Path("/tmp/projects")
     assert spec.project_name == "sample"
     assert spec.gpr_path == Path("/tmp/projects/sample.gpr")
-    assert spec.pyghidra_mcp_dir == Path("/tmp/projects/sample-pyghidra-mcp")
+    assert spec.ghidra_nexus_dir == Path("/tmp/projects/sample-pyghidra-mcp")
 
 
 def test_project_spec_rejects_project_name_with_gpr_path():
@@ -27,13 +27,13 @@ def test_project_spec_from_directory_path():
     assert spec.project_directory == Path("/tmp/projects")
     assert spec.project_name == "sample"
     assert spec.gpr_path == Path("/tmp/projects/sample.gpr")
-    assert spec.pyghidra_mcp_dir == Path("/tmp/projects/sample-pyghidra-mcp")
+    assert spec.ghidra_nexus_dir == Path("/tmp/projects/sample-pyghidra-mcp")
 
 
 def test_gui_stdio_rejected_before_ghidra_start():
     import click.testing
 
-    from pyghidra_mcp.server import main
+    from ghidra_nexus.server import main
 
     runner = click.testing.CliRunner()
     result = runner.invoke(main, ["--gui", "--transport", "stdio"])

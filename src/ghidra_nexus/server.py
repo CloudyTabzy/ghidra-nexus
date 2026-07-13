@@ -50,6 +50,55 @@ async def server_lifespan(server: Server) -> AsyncIterator[MCPContext]:
             context.close()
 
 
+# Windows-locked paths where IDA writes would fail silently. Mirrors what we
+# observed in the IDA Pro / Synapse MCP feedback: users saved IDBs into
+# Program Files and got mysterious analysis failures.
+_WINDOWS_LOCKED_PATHS = (
+    Path("C:/Program Files"),
+    Path("C:/Program Files (x86)"),
+    Path("C:/ProgramData"),
+    Path("C:/Windows"),
+)
+
+
+def _check_project_path_writable(project_path: Path) -> list[str]:
+    """Return a list of agent-visible warnings about the project path.
+
+    Empty list means the path is writable. Non-empty list contains one-sentence
+    warnings the agent should surface in ``analysis_status.path_warnings``.
+    """
+    if project_path is None:
+        return []
+    warnings: list[str] = []
+    try:
+        resolved = project_path.resolve()
+    except Exception:
+        return warnings
+    parts = resolved.parts
+    for i in range(len(parts)):
+        candidate = Path(*parts[: i + 1])
+        if candidate in _WINDOWS_LOCKED_PATHS:
+            warnings.append(
+                f"project_path={project_path} lives under {candidate}, a UAC-locked "
+                f"directory on Windows; IDA writes may fail silently. Move the project "
+                f"to ~/analysis or another writable location before importing binaries."
+            )
+            break
+    # Try a write-test only when the path exists; missing path is fine (we'll
+    # create it on import).
+    if resolved.exists():
+        try:
+            probe = resolved / ".nexus_writability_probe"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+        except Exception as e:
+            warnings.append(
+                f"project_path={project_path} exists but is not writable: {e}. "
+                f"Choose a writable location."
+            )
+    return warnings
+
+
 mcp = FastMCP("ghidra-nexus", lifespan=server_lifespan)  # type: ignore
 
 
@@ -67,6 +116,7 @@ def register_common_tools(server: FastMCP) -> None:
     server.tool()(mcp_tools.set_comment)
     server.tool()(mcp_tools.delete_project_binary)
     server.tool()(mcp_tools.list_exports)
+    server.tool()(mcp_tools.section_health)
     server.tool()(mcp_tools.list_imports)
     server.tool()(mcp_tools.list_xrefs)
     server.tool()(mcp_tools.search_strings)

@@ -4,9 +4,9 @@ from unittest.mock import Mock, call
 
 import pytest
 
-import pyghidra_mcp.gui_context as gui_context_module
-from pyghidra_mcp.context import ProgramInfo
-from pyghidra_mcp.gui_context import GuiPyGhidraContext
+import ghidra_nexus.gui_context as gui_context_module
+from ghidra_nexus.context import ProgramInfo
+from ghidra_nexus.gui_context import GuiPyGhidraContext
 
 
 def test_unique_short_name_match_returns_unambiguous_program():

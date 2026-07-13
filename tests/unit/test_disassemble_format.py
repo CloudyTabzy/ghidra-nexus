@@ -3,7 +3,7 @@
 The formatter is pure (no Ghidra runtime needed), so it is exercised directly.
 """
 
-from pyghidra_mcp.tools import GhidraTools
+from ghidra_nexus.tools import GhidraTools
 
 # (address, bytes_hex, mnemonic, operands)
 ROWS = [

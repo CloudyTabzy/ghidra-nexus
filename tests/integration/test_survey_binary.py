@@ -13,8 +13,8 @@ from mcp import ClientSession
 from mcp.client.stdio import stdio_client
 from mcp.shared.exceptions import McpError
 
-from pyghidra_mcp.context import PyGhidraContext
-from pyghidra_mcp.models import SurveyBinaryResult
+from ghidra_nexus.context import PyGhidraContext
+from ghidra_nexus.models import SurveyBinaryResult
 
 
 def _wait_for_binary_ready(

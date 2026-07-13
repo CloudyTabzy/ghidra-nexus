@@ -13,8 +13,8 @@ from unittest.mock import Mock
 import pytest
 from mcp.shared.exceptions import McpError
 
-from pyghidra_mcp import mcp_tools
-from pyghidra_mcp.models import (
+from ghidra_nexus import mcp_tools
+from ghidra_nexus.models import (
     SurveyBinaryResult,
     SurveyCallGraphSummary,
     SurveyMetadata,

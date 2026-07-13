@@ -13,7 +13,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
-from pyghidra_mcp.context import PyGhidraContext
+from ghidra_nexus.context import PyGhidraContext
 
 
 def _find_free_port() -> int:
@@ -119,7 +119,7 @@ async def test_gui_smoke(
         command="python",
         args=[
             "-m",
-            "pyghidra_mcp",
+            "ghidra_nexus",
             "--project-path",
             str(project_dir),
             "--project-name",
@@ -157,7 +157,7 @@ async def test_gui_smoke(
             "python",
             "-u",
             "-m",
-            "pyghidra_mcp",
+            "ghidra_nexus",
             "--gui",
             "--transport",
             "streamable-http",

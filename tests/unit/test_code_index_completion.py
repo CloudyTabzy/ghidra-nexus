@@ -9,7 +9,7 @@ These tests exercise the gate against a real PersistentClient (no Ghidra runtime
 needed), reopening the client between steps to prove the marker is durable.
 """
 
-from pyghidra_mcp.indexing_mixin import COLLECTION_COMPLETE_KEY, IndexingMixin
+from ghidra_nexus.indexing_mixin import COLLECTION_COMPLETE_KEY, IndexingMixin
 
 
 class _Probe(IndexingMixin):

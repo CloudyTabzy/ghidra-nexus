@@ -2,8 +2,8 @@ import sys
 import types
 from unittest.mock import Mock, call
 
-import pyghidra_mcp.context as context_module
-from pyghidra_mcp.context import PyGhidraContext
+import ghidra_nexus.context as context_module
+from ghidra_nexus.context import PyGhidraContext
 
 
 def test_init_project_programs_uses_domain_file_paths(monkeypatch):

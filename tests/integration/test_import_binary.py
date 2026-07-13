@@ -6,7 +6,7 @@ import pytest
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client
 
-from pyghidra_mcp.context import PyGhidraContext
+from ghidra_nexus.context import PyGhidraContext
 
 
 @pytest.fixture()

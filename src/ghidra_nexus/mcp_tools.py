@@ -16,8 +16,10 @@ from mcp.shared.exceptions import McpError
 from mcp.types import INTERNAL_ERROR, INVALID_PARAMS, ErrorData
 
 from ghidra_nexus.context_protocol import MCPContext
+from ghidra_nexus.errors import ToolErrorCode, make_tool_error
 from ghidra_nexus.ghidra_executor import get_executor
 from ghidra_nexus.models import (
+    AnalysisStatusResult,
     BytesReadResult,
     CallGraphDirection,
     CallGraphDisplayType,
@@ -39,6 +41,7 @@ from ghidra_nexus.models import (
     RenameResponse,
     SaveRequestResult,
     SearchMode,
+    SectionHealth,
     StringSearchResults,
     SurveyBinaryResult,
     SymbolSearchResults,
@@ -101,15 +104,58 @@ def _get_context(ctx: Context) -> MCPContext:
     return pyghidra_context
 
 
+def _error_tool_response(
+    code: ToolErrorCode | str, message: str, **kwargs
+) -> dict:
+    """Build a tool-result dict that conforms to the ToolError schema.
+
+    Tools return this *as their result*, not as a raised framework exception.
+    The agent sees the structured error in the tool-response body.
+    """
+    return make_tool_error(code, message, **kwargs)
+
+
+class _ToolRecoverable(Exception):
+    """Marker exception: errors that the agent can recover from.
+
+    Raise ``_ToolRecoverable(ToolErrorCode.SYMBOL_NOT_FOUND, "...")`` from a tool
+    body; the decorator catches it and returns the structured :class:`ToolError`
+    response (instead of a framework-level McpError). This is the agent-first
+    escape hatch from :mod:`errors`.
+    """
+
+    def __init__(self, code: ToolErrorCode, message: str, **kwargs):
+        self.code = code
+        self.message = message
+        self.kwargs = kwargs
+
+
 def mcp_error_handler(func):
-    """Decorator that provides centralized error handling for MCP tools."""
+    """Decorator that provides centralized error handling for MCP tools.
+
+    Behaviour:
+
+    - Functions that return normally return their value.
+    - ``McpError`` raised → re-raised (framework-level error, agent's invocation
+      was wrong at the protocol level).
+    - ``_ToolRecoverable(code, message, **)`` raised → tool returns the structured
+      ``ToolError`` dict matching the schema. ``code`` is the stable string,
+      ``message`` is human readable. ``binary_name`` / ``addr`` can be passed in
+      ``kwargs``.
+    - Any other ``Exception`` → raised as ``McpError(INTERNAL_ERROR)`` (programmer
+      bug; the watchdog counter ticks once).
+    """
 
     action = _get_action_name(func.__name__)
 
-    def handle_error(e):
+    def handle_recoverable(exc: _ToolRecoverable) -> dict:
+        return _error_tool_response(exc.code, exc.message, **exc.kwargs)
+
+    def handle_unexpected(e: Exception):
         if isinstance(e, McpError):
             return e
         if isinstance(e, (ValueError, FileNotFoundError, AttributeError)):
+            # Userland validation errors — keep McpError but enrich with hint.
             return McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
         wd = get_watchdog()
         if wd is not None:
@@ -120,15 +166,23 @@ def mcp_error_handler(func):
     async def async_wrapper(*args, **kwargs):
         try:
             return await func(*args, **kwargs)
+        except _ToolRecoverable as e:
+            return handle_recoverable(e)
+        except McpError:
+            raise
         except Exception as e:
-            raise handle_error(e) from e
+            raise handle_unexpected(e) from e
 
     @functools.wraps(func)
     def sync_wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
+        except _ToolRecoverable as e:
+            return handle_recoverable(e)
+        except McpError:
+            raise
         except Exception as e:
-            raise handle_error(e) from e
+            raise handle_unexpected(e) from e
 
     return async_wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper
 
@@ -591,15 +645,93 @@ async def gen_callgraph(
 
 
 @mcp_error_handler
-async def analysis_status(ctx: Context) -> ProgramInfos:
-    """Show analysis progress for all binaries in the project.
+async def analysis_status(ctx: Context) -> AnalysisStatusResult:
+    """Show analysis progress + project-level warnings.
 
-    Use this before calling decompile or search tools to check whether
-    each binary has finished Ghidra analysis and ChromaDB indexing.
-    'code_indexed' means semantic search is available.
+    This is the agent's single source of truth for "what does the project
+    look like right now" — poll this instead of trusting free-text error
+    responses from individual tool calls.
+
+    Per binary, returns:
+        - ``analysis_state`` — lifecycle stage (queued / loading / analyzing /
+          complete / failed)
+        - ``function_count`` — live count from Ghidra; ``0`` means not analyzed yet
+        - ``entropy_summary`` — top-level entropy profile (encrypted / compressed /
+          normal / mixed)
+        - ``project_path`` / ``nexus_data_dir`` / ``idb_path`` — absolute paths
+          the agent can validate against ``os.path.exists``
+        - ``recommended_tools`` — what to call next given current state
+
+    Server-level:
+        - ``path_warnings`` — writability warnings about the project path. Empty
+          on a healthy setup; contains surface warnings about UAC-locked
+          directories on Windows before IDB writes silently fail.
     """
+    from ghidra_nexus import __version__
+    from ghidra_nexus.server import _check_project_path_writable
+
     pyghidra_context = _get_context(ctx)
-    return ProgramInfos(programs=pyghidra_context.list_project_binary_infos())
+
+    # Snapshot the raw models from the context.
+    raw_infos = pyghidra_context.list_project_binary_infos()
+
+    # Normalize into the new ProgramInfo shape.
+    binaries: list = []
+    for raw in raw_infos:
+        # Translate internal state to the agent-facing string.
+        if raw.analysis_complete:
+            state = "complete"
+        else:
+            state = "analyzing_functions"
+
+        recommended: list[str] = []
+        if not raw.analysis_complete:
+            recommended = ["survey_binary_fast", "analysis_status"]
+        elif getattr(raw, "code_indexed", False):
+            recommended = ["survey_binary_full", "search_code"]
+        else:
+            recommended = ["survey_binary_full", "section_health"]
+
+        binaries.append(
+            ProgramInfo(
+                name=raw.name,
+                file_path=raw.file_path,
+                load_time=raw.load_time,
+                analysis_complete=raw.analysis_complete,
+                metadata=raw.metadata,
+                code_indexed=raw.code_indexed,
+                strings_indexed=raw.strings_indexed,
+                analysis_state=state,
+                function_count=len(getattr(raw.metadata, "function_count", 0) or 0)
+                if isinstance(raw.metadata, dict)
+                else 0,
+                sha256=(raw.metadata or {}).get("sha256") if isinstance(raw.metadata, dict) else None,
+                entropy_summary=(raw.metadata or {}).get("entropy_summary", "normal")
+                if isinstance(raw.metadata, dict)
+                else "normal",
+                project_path=str(getattr(pyghidra_context, "project_path", None) or "")
+                or None,
+                nexus_data_dir=str(getattr(pyghidra_context, "nexus_data_dir", None) or "")
+                or None,
+                idb_path=str(getattr(raw, "file_path", None) or "") or None,
+                recommended_tools=recommended,
+            )
+        )
+
+    # Server-level path warnings.
+    project_path = getattr(pyghidra_context, "project_path", None)
+    warnings = []
+    try:
+        if project_path is not None:
+            warnings = _check_project_path_writable(Path(str(project_path)))
+    except Exception:
+        warnings = []
+
+    return AnalysisStatusResult(
+        binaries=binaries,
+        path_warnings=warnings,
+        server_version=__version__,
+    )
 
 
 @mcp_error_handler
@@ -752,6 +884,39 @@ async def survey_binary_full(
 
 
 @mcp_error_handler
+async def section_health(binary_name: str, ctx: Context) -> list[SectionHealth]:
+    """Per-section entropy + classification + agent recommendation.
+
+    Returns a flat list, one entry per initialised memory block, with:
+        - ``entropy``             — Shannon bits/byte (0..8)
+        - ``classification``      — code / data / compressed / encrypted / unknown
+        - ``recommendation``      — analyze / skip / decompress / dump_runtime
+        - ``reason``              — one-sentence why this classification
+
+    **First call after ``analysis_status`` reports complete.** Surfaces
+    encrypted `.text` sections (e.g. Affinity, modern packers) in one call,
+    saving the agent from blind `decompile_function` loops that all return
+    garbage.
+
+    For modern protected binaries where the `.text` is high-entropy, expect
+    one row per section with ``classification: encrypted`` and
+    ``recommendation: dump_runtime``. The agent's path then becomes
+    ``list_functions`` + ``lief_strings`` + cross-DLL static analysis,
+    not decompile.
+    """
+    pyghidra_context = _get_context(ctx)
+    program_info = pyghidra_context.get_program_info(binary_name)
+    tools = GhidraTools(program_info)
+
+    def _run():
+        return tools.section_health()
+
+    return await get_executor().submit(
+        program_info, _run, task_id=f"section_health:{binary_name}"
+    )
+
+
+@mcp_error_handler
 async def import_binary(binary_path: str, ctx: Context) -> ImportRequestResult:
     pyghidra_context = _get_context(ctx)
     return pyghidra_context.import_binary_backgrounded(binary_path)
@@ -791,6 +956,7 @@ def _register_all_on_demand(mcp_server):
         (read_bytes, "read_bytes"),
         (disassemble, "disassemble"),
         (gen_callgraph, "gen_callgraph"),
+        (section_health, "section_health"),
         (analysis_status, "analysis_status"),
         (import_binary, "import_binary"),
         (save, "save"),

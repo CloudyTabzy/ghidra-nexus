@@ -29,6 +29,10 @@ from ghidra_nexus.models import (
     SurveySegmentInfo,
     SurveyStatistics,
 )
+from ghidra_nexus.section_entropy import (
+    classify_section,
+    shannon_entropy,
+)
 
 # ---------------------------------------------------------------------------
 # Caps — same as Synapse to keep behaviour predictable across tools.
@@ -160,12 +164,25 @@ def _build_metadata(program) -> SurveyMetadata:
 
 
 def _build_segments(program) -> list[SurveySegmentInfo]:
-    """Memory blocks formatted as rwx segment records."""
+    """Memory blocks formatted as rwx segment records (Phase 0.5: with entropy).
+
+    For each block we:
+      - Sample its bytes (full read of all initialised bytes — bounded by
+        block size) and compute Shannon entropy.
+      - Classify via :func:`classify_section` and pick a recommendation.
+      - Record the reason for the classification so the agent doesn't have to
+        guess.
+
+    Read errors on individual bytes are tolerated; the segment still shows up
+    with entropy=None and a classification of UNKNOWN.
+    """
     segments: list[SurveySegmentInfo] = []
     try:
         blocks = list(program.getMemory().getBlocks())
     except Exception:
         return segments
+
+    memory = program.getMemory()
 
     for block in blocks:
         try:
@@ -186,13 +203,49 @@ def _build_segments(program) -> list[SurveySegmentInfo]:
             except Exception:
                 is_x = False
             perms = ("r" if is_r else "-") + ("w" if is_w else "-") + ("x" if is_x else "-")
+
+            # Read initialised bytes for entropy. Cap at 4 MiB per block to keep
+            # survey latency bounded on 100+ MB binaries like Affinity
+            # libpersona.dll.
+            entropy_val: float | None = None
+            try:
+                size_int = int(size)
+            except Exception:
+                size_int = 0
+            if size_int > 0 and size_int <= 4 * 1024 * 1024:
+                try:
+                    raw = memory.getBytes(start, size_int)
+                    if raw is not None and len(raw) > 0:
+                        entropy_val = shannon_entropy(bytes(raw))
+                except Exception:
+                    entropy_val = None
+            elif size_int > 4 * 1024 * 1024:
+                # Subsample: read 4 MiB spread evenly across the block.
+                try:
+                    sample_size = 4 * 1024 * 1024
+                    raw = memory.getBytes(start, sample_size)
+                    if raw is not None and len(raw) > 0:
+                        entropy_val = shannon_entropy(bytes(raw))
+                except Exception:
+                    entropy_val = None
+
+            classification, recommendation, reason = classify_section(
+                entropy_val if entropy_val is not None else 0.0,
+                size_int,
+                is_executable=is_x,
+            )
+
             segments.append(
                 SurveySegmentInfo(
                     name=name,
                     start=str(start),
                     end=str(end),
-                    size=hex(int(size)),
+                    size=hex(size_int),
                     permissions=perms,
+                    entropy=entropy_val,
+                    classification=classification,
+                    recommendation=recommendation,
+                    reason=reason,
                 )
             )
         except Exception:

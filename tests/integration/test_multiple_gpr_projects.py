@@ -23,7 +23,7 @@ def server_params_specific_project(multi_project_directory, ghidra_env):
         command="python",
         args=[
             "-m",
-            "pyghidra_mcp",
+            "ghidra_nexus",
             "--project-path",
             str(project_dir),
             "--project-name",
@@ -42,7 +42,7 @@ def server_params_other_project(multi_project_directory, ghidra_env):
         command="python",
         args=[
             "-m",
-            "pyghidra_mcp",
+            "ghidra_nexus",
             "--project-path",
             str(project_dir),
             "--project-name",
@@ -160,7 +160,7 @@ async def test_shared_base_directory_projects(ghidra_env):
             command="python",
             args=[
                 "-m",
-                "pyghidra_mcp",
+                "ghidra_nexus",
                 "--project-path",
                 str(proj1_dir),
                 "--project-name",
@@ -174,7 +174,7 @@ async def test_shared_base_directory_projects(ghidra_env):
             command="python",
             args=[
                 "-m",
-                "pyghidra_mcp",
+                "ghidra_nexus",
                 "--project-path",
                 str(proj2_dir),
                 "--project-name",

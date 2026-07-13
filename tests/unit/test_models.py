@@ -1,4 +1,4 @@
-from pyghidra_mcp.models import (
+from ghidra_nexus.models import (
     BytesReadResult,
     CodeSearchResult,
     CodeSearchResults,

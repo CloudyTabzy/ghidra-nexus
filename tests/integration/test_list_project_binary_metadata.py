@@ -4,7 +4,7 @@ import pytest
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client
 
-from pyghidra_mcp.models import ProgramInfos
+from ghidra_nexus.models import ProgramInfos
 
 
 @pytest.mark.asyncio

@@ -164,7 +164,7 @@ def server_params_no_input(ghidra_env, isolated_project_root):
         command="python",
         args=[
             "-m",
-            "pyghidra_mcp",
+            "ghidra_nexus",
             *_isolated_project_args(isolated_project_root, "server_params_no_input"),
             "--wait-for-analysis",
         ],
@@ -179,7 +179,7 @@ def server_params(test_binary, ghidra_env, isolated_project_root):
         command="python",
         args=[
             "-m",
-            "pyghidra_mcp",
+            "ghidra_nexus",
             *_isolated_project_args(isolated_project_root, "server_params"),
             "--wait-for-analysis",
             test_binary,
@@ -195,7 +195,7 @@ def server_params_no_thread(test_binary, ghidra_env, isolated_project_root):
         command="python",
         args=[
             "-m",
-            "pyghidra_mcp",
+            "ghidra_nexus",
             *_isolated_project_args(isolated_project_root, "server_params_no_thread"),
             "--no-threaded",
             test_binary,
@@ -211,7 +211,7 @@ def server_params_shared_object(test_shared_object, ghidra_env, isolated_project
         command="python",
         args=[
             "-m",
-            "pyghidra_mcp",
+            "ghidra_nexus",
             *_isolated_project_args(isolated_project_root, "server_params_shared_object"),
             "--wait-for-analysis",
             test_shared_object,
@@ -243,7 +243,7 @@ def server_params_existing_notepad_project(ghidra_env):
     project_path = Path(__file__).parent.parent.parent / "other_projects" / "notepad.gpr"
     return StdioServerParameters(
         command="python",
-        args=["-m", "pyghidra_mcp", "--project-path", str(project_path), "--wait-for-analysis"],
+        args=["-m", "ghidra_nexus", "--project-path", str(project_path), "--wait-for-analysis"],
         env=ghidra_env,
     )
 
@@ -261,7 +261,7 @@ def server_params_custom_project_name(custom_project_directory, ghidra_env):
     custom_project = custom_project_directory / "my_analysis_project"
     return StdioServerParameters(
         command="python",
-        args=["-m", "pyghidra_mcp", "--project-path", str(custom_project), "--wait-for-analysis"],
+        args=["-m", "ghidra_nexus", "--project-path", str(custom_project), "--wait-for-analysis"],
         env=ghidra_env,
     )
 
@@ -272,6 +272,6 @@ def server_params_nested_project_location(custom_project_directory, ghidra_env):
     nested_project = custom_project_directory / "deeply/nested/location/test_project"
     return StdioServerParameters(
         command="python",
-        args=["-m", "pyghidra_mcp", "--project-path", str(nested_project), "--wait-for-analysis"],
+        args=["-m", "ghidra_nexus", "--project-path", str(nested_project), "--wait-for-analysis"],
         env=ghidra_env,
     )

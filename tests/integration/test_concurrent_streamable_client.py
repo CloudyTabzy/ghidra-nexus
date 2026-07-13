@@ -12,8 +12,8 @@ import pytest
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-from pyghidra_mcp.context import PyGhidraContext
-from pyghidra_mcp.models import (
+from ghidra_nexus.context import PyGhidraContext
+from ghidra_nexus.models import (
     BytesReadResult,
     CallGraphResult,
     CodeSearchResults,
@@ -107,7 +107,7 @@ def streamable_server(test_binary, ghidra_env, streamable_project_args, streamab
         [
             "python",
             "-m",
-            "pyghidra_mcp",
+            "ghidra_nexus",
             *streamable_project_args,
             "--wait-for-analysis",
             "--transport",

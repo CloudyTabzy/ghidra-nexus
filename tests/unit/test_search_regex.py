@@ -4,7 +4,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from pyghidra_mcp.tools import GhidraTools
+from ghidra_nexus.tools import GhidraTools
 
 
 def _make_mock_symbol(name, address="0x1000", qualified_name=None):

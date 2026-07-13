@@ -491,17 +491,27 @@ class PyGhidraContext(IndexingMixin):
             logger.error(f"Background binary import failed: {e}", exc_info=True)
 
     def import_binary_backgrounded(self, binary_path: str | Path) -> ImportRequestResult:
-        """
-        Spawns a thread and imports a binary into the project.
-        When the binary is analyzed it will be added to the project.
+        """Spawn a background import + return a task ID and canonical binary name.
+
+        Phase 0.5 enrichment: the result now carries ``task_id`` (deterministic
+        string for polling), ``binary_name`` (canonical project name computed by
+        :meth:`_gen_unique_bin_name`), ``analysis_state``, ``function_count``,
+        ``idb_path``, ``project_path``, and ``nexus_data_dir``. The agent can poll
+        ``analysis_status`` using the returned ``binary_name``; the agent never
+        has to guess when the import has actually finished.
 
         Args:
             binary_path: The path of the binary to import.
         """
-        if not Path(binary_path).exists():
+        import uuid
+
+        binary_path = Path(binary_path)
+        if not binary_path.exists():
             raise FileNotFoundError(f"The file {binary_path} cannot be found")
 
         import_plan = build_import_plan([binary_path])
+
+        task_id = str(uuid.uuid4())
 
         if self.import_executor and import_plan.candidates:
             future = self.import_executor.submit(
@@ -518,11 +528,44 @@ class PyGhidraContext(IndexingMixin):
             SkippedImportModel(path=str(skipped.path), reason=skipped.reason)
             for skipped in import_plan.skipped
         ]
+
+        # Canonical binary name — the agent uses this for every other tool.
+        if queued_paths:
+            canonical_name = self._gen_unique_bin_name(Path(queued_paths[0]))
+        else:
+            canonical_name = ""
+
+        # Live function_count: 0 until analysis finishes. Returns the current
+        # count if the binary already exists (re-import case).
+        function_count = 0
+        if canonical_name and canonical_name in self.programs:
+            pi = self.programs[canonical_name]
+            function_count = self._safe_function_count(pi)
+
         message = (
-            f"Queued {len(queued_paths)} import(s) from {binary_path} in the background."
+            f"Queued {len(queued_paths)} import(s) from {binary_path} in the background; "
+            f"poll analysis_status with binary_name={canonical_name!r}."
             if queued_paths
             else f"No importable files were queued from {binary_path}."
         )
+
+        # IDB path: where Ghidra will land the file. Matches the project's
+        # import strategy; the agent can validate it exists on disk after
+        # import completes.
+        idb_path: str | None = None
+        if canonical_name:
+            try:
+                # We use the canonical name to build the path; if the import
+                # created a folder, the file lives under that folder. Use the
+                # project's root folder as the safe default for now.
+                from ghidra.framework.model import DomainFolder  # type: ignore
+
+                root = self.project.getRootFolder()
+                if isinstance(root, DomainFolder):
+                    idb_path = str(Path(root.getProjectLocator().getLocation()) / f"{canonical_name}.gpr")
+            except Exception:
+                idb_path = None
+
         return ImportRequestResult(
             requested_path=str(binary_path),
             queued_count=len(queued_paths),
@@ -530,7 +573,28 @@ class PyGhidraContext(IndexingMixin):
             skipped_count=len(skipped),
             skipped=skipped,
             message=message,
+            task_id=task_id,
+            binary_name=canonical_name or None,
+            analysis_state="queued" if queued_paths else "failed",
+            function_count=function_count,
+            idb_path=idb_path,
+            project_path=str(self.project_path),
+            nexus_data_dir=str(self.nexus_data_dir),
         )
+
+    @staticmethod
+    def _safe_function_count(program_info) -> int:
+        """Best-effort function count; returns 0 on any error."""
+        try:
+            from ghidra.program.model.listing import Program
+
+            program: Program = program_info.program
+            if program is None:
+                return 0
+            fm = program.getFunctionManager()
+            return int(fm.getFunctionCount())
+        except Exception:
+            return 0
 
     def get_program_info(self, binary_name: str) -> "ProgramInfo":
         """Get program info or raise ValueError if not found."""

@@ -3,7 +3,7 @@ import types
 from pathlib import Path
 from unittest.mock import Mock
 
-from pyghidra_mcp.gui_launcher import GuiPyGhidraMcpLauncher
+from ghidra_nexus.gui_launcher import GuiPyGhidraMcpLauncher
 
 
 def test_request_shutdown_closes_frontend_tool(monkeypatch):

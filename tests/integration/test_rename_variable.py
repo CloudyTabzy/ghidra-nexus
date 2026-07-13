@@ -104,7 +104,7 @@ def variable_server_params(variable_test_binary, ghidra_env, isolated_project_ro
         command=sys.executable,
         args=[
             "-m",
-            "pyghidra_mcp",
+            "ghidra_nexus",
             "--project-path",
             str(isolated_project_root / "variable_server_params"),
             "--project-name",

@@ -1,6 +1,6 @@
 import tomli
 
-from pyghidra_mcp import __version__
+from ghidra_nexus import __version__
 
 
 def test_version_matches_pyproject():

@@ -15,6 +15,21 @@ class DecompiledFunction(BaseModel):
             "decompiler_error (Ghidra decompiler failed)"
         ),
     )
+    # New (Phase 0.5): explicit failure classification. Stable string the
+    # agent branches on; one of ToolErrorCode.* values or None on success.
+    error_code: str | None = Field(
+        None,
+        description=(
+            "On decompile failure, one of the stable ToolErrorCode values: "
+            "encrypted_bytes, function_too_small, no_license, unsupported_isa, "
+            "decompile_failed. None when decompiler_status='decompiled' or "
+            "'decompiled_empty'."
+        ),
+    )
+    hint: str | None = Field(
+        None,
+        description="One-sentence next step on decompile failure.",
+    )
     callees: list[str] | None = None
     referenced_strings: list[str] | None = None
     xrefs: list["CrossReferenceInfo"] | None = None
@@ -29,6 +44,31 @@ class ProgramBasicInfos(BaseModel):
     programs: list[ProgramBasicInfo]
 
 
+class AnalysisState(str, Enum):
+    """Lifecycle stage of a Ghidra binary's analysis.
+
+    Reported by ``analysis_status`` and ``import_binary``. Agents poll until
+    ``analysis_complete == "complete"`` (or until a state they care about
+    transitions).
+    """
+
+    QUEUED = "queued"                      # import_binary returned; not loaded yet
+    LOADING = "loading"                    # Ghidra is reading file bytes
+    ANALYZING_FUNCTIONS = "analyzing_functions"
+    ANALYZING_DATA = "analyzing_data"
+    COMPLETE = "complete"
+    FAILED = "failed"
+
+
+class EntropySummary(str, Enum):
+    """Top-level entropy profile across the binary's sections."""
+
+    ENCRYPTED = "encrypted"        # any section >= 7.0 entropy
+    COMPRESSED = "compressed"      # any section 5.5-7.0 entropy, none above
+    NORMAL = "normal"              # all sections < 5.5 entropy
+    MIXED = "mixed"                # some normal + some encrypted/compressed
+
+
 class ProgramInfo(BaseModel):
     name: str
     file_path: str | None = None
@@ -37,6 +77,41 @@ class ProgramInfo(BaseModel):
     metadata: dict
     code_indexed: bool
     strings_indexed: bool
+
+    # --- Phase 0.5 additions ---
+    analysis_state: str = "complete"  # AnalysisState value
+    function_count: int = 0
+    sha256: str | None = None
+    entropy_summary: str = "normal"   # EntropySummary value
+    project_path: str | None = None
+    nexus_data_dir: str | None = None
+    idb_path: str | None = None
+    recommended_tools: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Tools the agent should call next given this binary's state. e.g. "
+            "['survey_binary_fast', 'section_health'] for fresh import."
+        ),
+    )
+
+
+class AnalysisStatusResult(BaseModel):
+    """Top-level ``analysis_status`` response.
+
+    Wraps a list of :class:`ProgramInfo` plus server-level path warnings. This
+    is THE source of truth for "what does the project look like right now" —
+    agents should poll this rather than rely on free-text error responses.
+    """
+
+    binaries: list[ProgramInfo]
+    path_warnings: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Server-level warnings about project_path writability. Surfaces UAC-locked "
+            "directories on Windows before IDB writes silently fail."
+        ),
+    )
+    server_version: str = ""
 
 
 class ProgramInfos(BaseModel):
@@ -60,12 +135,121 @@ class SkippedImport(BaseModel):
 
 
 class ImportRequestResult(BaseModel):
+    """Result of ``import_binary``.
+
+    Phase 0.5 additions:
+        - ``task_id`` lets the agent poll ``analysis_status`` deterministically.
+        - ``binary_name`` is the canonical name the agent uses for every other
+          tool call (we resolve paths to canonical names once at import time).
+        - ``analysis_state`` is the lifecycle stage: ``queued`` | ``loading`` |
+          ``analyzing_functions`` | ``analyzing_data`` | ``complete`` | ``failed``.
+        - ``function_count`` is the live function count at this instant. Stays
+          0 until Ghidra finds functions.
+        - ``idb_path`` is the absolute path to the saved IDB; the agent can
+          validate ``os.path.exists`` against it.
+    """
+
     requested_path: str
     queued_count: int
     queued_paths: list[str]
     skipped_count: int
     skipped: list[SkippedImport]
     message: str
+
+    task_id: str | None = None
+    binary_name: str | None = None
+    analysis_state: str = "queued"
+    function_count: int = 0
+    idb_path: str | None = None
+    project_path: str | None = None
+    nexus_data_dir: str | None = None
+
+
+class SectionClassification(str, Enum):
+    """Agent-friendly classification of a memory section based on entropy + perms."""
+
+    CODE = "code"
+    DATA = "data"
+    COMPRESSED = "compressed"
+    ENCRYPTED = "encrypted"
+    UNKNOWN = "unknown"
+
+
+class SectionRecommendation(str, Enum):
+    """Action the agent should take for a section."""
+
+    ANALYZE = "analyze"            # Code or low-entropy data — normal flow.
+    SKIP = "skip"                  # Skip — likely noise or irrelevant.
+    DECOMPRESS = "decompress"      # Compressed — run a decompressor pass first.
+    DUMP_RUNTIME = "dump_runtime"  # Encrypted at rest — need runtime dump.
+
+
+def classify_entropy(entropy: float, size_bytes: int) -> SectionClassification:
+    """Map a Shannon-entropy value (bits/byte) + section size to a classification.
+
+    Pure function so it can be unit-tested without a Ghidra program. Thresholds
+    match the IDA-side feedback heuristic with a small safety margin for
+    short sections where entropy estimation is noisy.
+    """
+    if size_bytes < 16:
+        return SectionClassification.UNKNOWN
+    if entropy >= 7.0:
+        return SectionClassification.ENCRYPTED
+    if entropy >= 5.5:
+        return SectionClassification.COMPRESSED
+    # Differentiate code vs data by proxy: anything executable with low entropy
+    # reads as code; non-executable low-entropy reads as data. Permission check
+    # is the caller's job (we don't have it here).
+    return SectionClassification.CODE
+
+
+def recommendation_for(classification: SectionClassification) -> SectionRecommendation:
+    if classification == SectionClassification.ENCRYPTED:
+        return SectionRecommendation.DUMP_RUNTIME
+    if classification == SectionClassification.COMPRESSED:
+        return SectionRecommendation.DECOMPRESS
+    if classification == SectionClassification.DATA:
+        return SectionRecommendation.SKIP
+    return SectionRecommendation.ANALYZE
+
+
+class SectionHealth(BaseModel):
+    """One row in the ``section_health`` MCP response.
+
+    This is the dedicated-tool surface; the survey path reuses the same fields
+    embedded in ``SurveySegmentInfo``.
+    """
+
+    name: str
+    start: str
+    end: str
+    size_bytes: int
+    entropy: float = Field(..., description="Shannon entropy in bits/byte (0..8).")
+    classification: SectionClassification
+    recommendation: SectionRecommendation
+    reason: str = Field(..., description="Human-readable why this classification was chosen.")
+    permissions: str = Field("---", description="rwx triplet, e.g. 'r-x', 'rw-'.")
+
+
+class SurveySegmentInfo(BaseModel):
+    """Per-section view in survey_binary. Phase 0.5 adds entropy + recommendation.
+
+    Existing fields preserved for backward compat; new fields are optional so
+    older clients don't see ``None`` noise.
+    """
+
+    name: str
+    start: str
+    end: str
+    size: str
+    permissions: str
+    entropy: float | None = None
+    classification: SectionClassification | None = None
+    recommendation: SectionRecommendation | None = None
+    reason: str | None = Field(
+        None,
+        description="Human-readable explanation for the classification.",
+    )
 
 
 class SaveRequestResult(BaseModel):

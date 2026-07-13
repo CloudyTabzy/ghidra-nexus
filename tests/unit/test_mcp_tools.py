@@ -3,8 +3,8 @@ from unittest.mock import Mock
 
 import pytest
 
-from pyghidra_mcp.gui_context import GuiPyGhidraContext
-from pyghidra_mcp.mcp_tools import (
+from ghidra_nexus.gui_context import GuiPyGhidraContext
+from ghidra_nexus.mcp_tools import (
     decompile_function,
     goto,
     list_project_binaries,
@@ -14,7 +14,7 @@ from pyghidra_mcp.mcp_tools import (
     set_function_prototype,
     set_variable_type,
 )
-from pyghidra_mcp.models import ProgramInfo, SymbolInfo
+from ghidra_nexus.models import ProgramInfo, SymbolInfo
 
 
 def test_list_project_binaries_uses_project_wide_context_listing():
@@ -55,7 +55,7 @@ def test_set_comment_uses_tool_path(monkeypatch):
     ctx = Mock()
     ctx.request_context.lifespan_context = pyghidra_context
 
-    monkeypatch.setattr("pyghidra_mcp.mcp_tools.GhidraTools", lambda _program_info: fake_tools)
+    monkeypatch.setattr("ghidra_nexus.mcp_tools.GhidraTools", lambda _program_info: fake_tools)
 
     response = set_comment(
         binary_name="sample",
@@ -87,7 +87,7 @@ def test_rename_variable_uses_tool_path(monkeypatch):
     ctx = Mock()
     ctx.request_context.lifespan_context = pyghidra_context
 
-    monkeypatch.setattr("pyghidra_mcp.mcp_tools.GhidraTools", lambda _program_info: fake_tools)
+    monkeypatch.setattr("ghidra_nexus.mcp_tools.GhidraTools", lambda _program_info: fake_tools)
 
     response = rename_variable(
         binary_name="sample",
@@ -123,7 +123,7 @@ def test_set_variable_type_uses_tool_path(monkeypatch):
     ctx = Mock()
     ctx.request_context.lifespan_context = pyghidra_context
 
-    monkeypatch.setattr("pyghidra_mcp.mcp_tools.GhidraTools", lambda _program_info: fake_tools)
+    monkeypatch.setattr("ghidra_nexus.mcp_tools.GhidraTools", lambda _program_info: fake_tools)
 
     response = set_variable_type(
         binary_name="sample",
@@ -158,7 +158,7 @@ def test_set_function_prototype_uses_tool_path(monkeypatch):
     ctx = Mock()
     ctx.request_context.lifespan_context = pyghidra_context
 
-    monkeypatch.setattr("pyghidra_mcp.mcp_tools.GhidraTools", lambda _program_info: fake_tools)
+    monkeypatch.setattr("ghidra_nexus.mcp_tools.GhidraTools", lambda _program_info: fake_tools)
 
     response = set_function_prototype(
         binary_name="sample",
@@ -192,7 +192,7 @@ async def test_decompile_function_offloads_with_timeout(monkeypatch):
     ctx = Mock()
     ctx.request_context.lifespan_context = pyghidra_context
 
-    monkeypatch.setattr("pyghidra_mcp.mcp_tools.GhidraTools", lambda _program_info: fake_tools)
+    monkeypatch.setattr("ghidra_nexus.mcp_tools.GhidraTools", lambda _program_info: fake_tools)
 
     async def fake_to_thread(fn, *args, **kwargs):
         return fn(*args, **kwargs)
@@ -233,7 +233,7 @@ async def test_decompile_does_not_block_other_tool_calls(monkeypatch):
     ctx = Mock()
     ctx.request_context.lifespan_context = pyghidra_context
 
-    monkeypatch.setattr("pyghidra_mcp.mcp_tools.GhidraTools", lambda _program_info: fake_tools)
+    monkeypatch.setattr("ghidra_nexus.mcp_tools.GhidraTools", lambda _program_info: fake_tools)
 
     decompile_started = asyncio.Event()
     release_decompile = asyncio.Event()

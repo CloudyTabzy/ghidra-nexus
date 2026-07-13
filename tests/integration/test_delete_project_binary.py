@@ -4,8 +4,8 @@ import pytest
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client
 
-from pyghidra_mcp.context import PyGhidraContext
-from pyghidra_mcp.models import (
+from ghidra_nexus.context import PyGhidraContext
+from ghidra_nexus.models import (
     ProgramInfos,
 )
 

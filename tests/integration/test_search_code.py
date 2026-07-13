@@ -5,8 +5,8 @@ import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from pyghidra_mcp.context import PyGhidraContext
-from pyghidra_mcp.models import CodeSearchResults, DecompiledFunction
+from ghidra_nexus.context import PyGhidraContext
+from ghidra_nexus.models import CodeSearchResults, DecompiledFunction
 
 
 @pytest.fixture(scope="module")
@@ -51,7 +51,7 @@ def server_params(test_binary, ghidra_env, search_code_project_args):
     """Get server parameters with a test binary."""
     return StdioServerParameters(
         command="python",
-        args=["-m", "pyghidra_mcp", *search_code_project_args, "--no-threaded", test_binary],
+        args=["-m", "ghidra_nexus", *search_code_project_args, "--no-threaded", test_binary],
         env=ghidra_env,
     )
 

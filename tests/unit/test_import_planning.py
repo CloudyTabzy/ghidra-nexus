@@ -1,6 +1,6 @@
 from pathlib import Path
 
-import pyghidra_mcp.import_planning as import_planning
+import ghidra_nexus.import_planning as import_planning
 
 
 def test_build_import_plan_skips_raw_single_file_and_directory_children(monkeypatch, tmp_path):
