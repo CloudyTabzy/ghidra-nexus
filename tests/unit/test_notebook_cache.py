@@ -8,7 +8,6 @@ Extractor families are guaranteed registered by conftest.py's session fixture.
 from __future__ import annotations
 
 import json
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -18,7 +17,6 @@ from ghidra_nexus.notebook.cache import (
     check_decompile_cache,
     check_disasm_cache,
     check_xrefs_cache,
-    resolve_binary_id,
     write_decompile_cache,
     write_disasm_cache,
     write_xrefs_cache,

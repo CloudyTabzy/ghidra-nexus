@@ -143,8 +143,8 @@ class GhidraTools:
                 if func:
                     return [func]
         except (Exception) as e:
-            from java.lang import IllegalArgumentException
             from ghidra.program.model.address import AddressFormatException
+            from java.lang import IllegalArgumentException
 
             if not isinstance(e, (IllegalArgumentException, AddressFormatException)):
                 raise
@@ -235,8 +235,8 @@ class GhidraTools:
                 if addr_symbols:
                     return list(addr_symbols)
         except (Exception) as e:
-            from java.lang import IllegalArgumentException
             from ghidra.program.model.address import AddressFormatException
+            from java.lang import IllegalArgumentException
 
             if not isinstance(e, (IllegalArgumentException, AddressFormatException)):
                 raise

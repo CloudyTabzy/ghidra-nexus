@@ -14,7 +14,6 @@ import pytest
 from ghidra_nexus.errors import ToolErrorCode, make_tool_error
 from ghidra_nexus.section_entropy import shannon_entropy
 
-
 pytestmark = pytest.mark.skipif(
     not os.environ.get("GHIDRA_INSTALL_DIR"),
     reason="GHIDRA_INSTALL_DIR not set; skipping Ghidra integration tests",

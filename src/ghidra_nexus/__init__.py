@@ -65,13 +65,13 @@ def __getattr__(name: str):
 
 __all__ = [
     "GhidraTools",
+    "Notebook",
     "ProgramInfo",
     "PyGhidraContext",
-    "Notebook",
+    "__author__",
+    "__description__",
+    "__project__",
+    "__version__",
     "main",
     "server",
-    "__version__",
-    "__author__",
-    "__project__",
-    "__description__",
 ]

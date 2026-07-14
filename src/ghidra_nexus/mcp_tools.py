@@ -161,18 +161,28 @@ _SESSION_ID = __import__("uuid").uuid4().hex[:12]  # per-daemon session id for b
 
 
 async def _get_notebook(pyghidra_context=None) -> Notebook:
-    """Return the per-process notebook singleton, deriving the path from context.
+    """Return the notebook, preferring the context's instance.
 
-    Path resolution order:
+    The context already owns a Notebook connection; re-using it avoids opening a
+    second SQLite handle to the same WAL file, which can deadlock under the
+    stdio transport's tight polling loop. Falls back to the per-process
+    singleton for tests and callers without a context.
+
+    Path resolution order (only used when no context notebook is available):
       1. ``NEXUS_NOTEBOOK_PATH`` env var (test isolation; highest priority)
       2. ``pyghidra_context.nexus_data_dir / notebook.sqlite`` (production)
       3. Default ``ghidra_nexus_projects/my_project-nexus/notebook.sqlite``
-
-    The env-var override is used by the test suite (see ``tests/unit/conftest.py``)
-    to give each test a tmp_path-based notebook. Without it, all tests share one
-    notebook file and write-through from one test pollutes another.
     """
     global _NOTEBOOK_SINGLETON
+    # Prefer the context-owned notebook to keep one SQLite connection.
+    # Only trust a real Notebook instance; Mock objects from unit tests must
+    # fall through to the singleton path so the test tmp_path notebook is used.
+    if pyghidra_context is not None:
+        context_nb = getattr(pyghidra_context, "_get_notebook", None)
+        if callable(context_nb):
+            nb = context_nb()
+            if isinstance(nb, Notebook):
+                return nb
     if _NOTEBOOK_SINGLETON is not None:
         return _NOTEBOOK_SINGLETON
     async with _NOTEBOOK_LOCK:
@@ -360,13 +370,21 @@ def mcp_error_handler(func):
 
     async def _insert_breadcrumb(kwargs):
         try:
+            ctx = kwargs.get("ctx")
+            if ctx is None:
+                return
+            pyghidra_context = _get_context(ctx)
             nb = await _get_notebook(pyghidra_context)
             binary_name = kwargs.get("binary_name")
+            bid = None
             if binary_name:
-                record_breadcrumb(nb, binary_id=None, session_id=_SESSION_ID, tool=tool_name,
-                                  summary=f"{action} on {binary_name}")
+                b = nb.binaries.get(binary_name)
+                if b:
+                    bid = b["id"]
+            record_breadcrumb(nb, binary_id=bid, session_id=_SESSION_ID, tool=tool_name,
+                              summary=f"{action} on {binary_name}" if binary_name else action)
         except Exception:
-            pass
+            logger.debug("breadcrumb failed for %s", tool_name, exc_info=True)
 
     def handle_exception(e: Exception):
         if isinstance(e, McpError):
@@ -842,7 +860,8 @@ def _resolve_full_code(
 @mcp_error_handler
 async def list_project_binaries(ctx: Context) -> ProgramInfos:
     pyghidra_context = _get_context(ctx)
-    return ProgramInfos(programs=pyghidra_context.list_project_binary_infos())
+    programs = pyghidra_context.list_project_binary_infos()
+    return ProgramInfos(programs=programs)
 
 
 @mcp_error_handler
@@ -1657,7 +1676,8 @@ async def import_binary(binary_path: str, ctx: Context) -> ImportRequestResult:
 @mcp_error_handler
 async def notebook_summary(binary_name: str | None, ctx: Context) -> dict:
     """Per-binary aggregate stats from the notebook cache."""
-    nb = await _get_notebook()
+    pyghidra_context = _get_context(ctx)
+    nb = await _get_notebook(pyghidra_context)
     if binary_name:
         b = nb.binaries.get(binary_name)
         if not b:
@@ -1683,7 +1703,8 @@ async def notebook_summary(binary_name: str | None, ctx: Context) -> dict:
 @mcp_error_handler
 async def notebook_search(binary_name: str, query: str, ctx: Context, kind: str = "any", limit: int = 20, offset: int = 0) -> dict:
     """FTS5 search over notebook views (summary + entities + function names)."""
-    nb = await _get_notebook()
+    pyghidra_context = _get_context(ctx)
+    nb = await _get_notebook(pyghidra_context)
     b = nb.binaries.get(binary_name)
     bid = b["id"] if b else 0
     hits = nb.search.query(query, binary_id=bid if bid else None, kind=None if kind == "any" else kind, limit=limit, offset=offset)
@@ -1693,7 +1714,8 @@ async def notebook_search(binary_name: str, query: str, ctx: Context, kind: str 
 @mcp_error_handler
 async def notebook_breadcrumbs(binary_name: str | None, ctx: Context, session_id: str | None = None, limit: int = 50) -> list[dict]:
     """Recent tool-call breadcrumbs from the notebook audit trail."""
-    nb = await _get_notebook()
+    pyghidra_context = _get_context(ctx)
+    nb = await _get_notebook(pyghidra_context)
     bid = None
     if binary_name:
         b = nb.binaries.get(binary_name)
@@ -1706,7 +1728,8 @@ async def notebook_breadcrumbs(binary_name: str | None, ctx: Context, session_id
 @mcp_error_handler
 async def notebook_alias(binary_name: str, addr: str, ctx: Context, name: str | None = None, tags: list[str] | None = None, status: str | None = None, notes: str | None = None) -> dict:
     """Set or get an address alias."""
-    nb = await _get_notebook()
+    pyghidra_context = _get_context(ctx)
+    nb = await _get_notebook(pyghidra_context)
     b = nb.binaries.get(binary_name)
     if not b:
         raise _ToolRecoverable(ToolErrorCode.BINARY_NOT_FOUND, f"Binary {binary_name!r} not found", binary_name=binary_name)
@@ -1721,7 +1744,8 @@ async def notebook_alias(binary_name: str, addr: str, ctx: Context, name: str | 
 @mcp_error_handler
 async def notebook_hypothesis(action: str, ctx: Context, id: int | None = None, binary_name: str | None = None, text: str | None = None, status: str | None = None) -> dict:
     """Hypothesis board CRUD (create, update, list, get)."""
-    nb = await _get_notebook()
+    pyghidra_context = _get_context(ctx)
+    nb = await _get_notebook(pyghidra_context)
     bid = None
     if binary_name:
         b = nb.binaries.get(binary_name)
@@ -1752,7 +1776,8 @@ async def notebook_embed_status(ctx: Context, binary_name: str | None = None) ->
     is attached to this notebook. If false, the queue accumulates but the
     worker is idle (e.g. vec unavailable or embedder failed to load).
     """
-    nb = await _get_notebook()
+    pyghidra_context = _get_context(ctx)
+    nb = await _get_notebook(pyghidra_context)
     worker = _get_embed_worker()
     # Queue counters via raw SQL (single round-trip)
     queue_counts = {
@@ -1839,8 +1864,10 @@ async def notebook_query_expand(
     Env vars: ``NEXUS_SLM_MODEL`` (e.g. ``Qwen/Qwen2.5-Coder-1.5B-Instruct``),
     ``NEXUS_SLM_DEVICE`` (cpu/cuda/mps), ``NEXUS_SLM_TIMEOUT_SEC`` (default 30).
     """
-    from ghidra_nexus.slm import is_available as _slm_available
-    from ghidra_nexus.slm import run_query_expand as _slm_run_query_expand
+    from ghidra_nexus.slm import (
+        is_available as _slm_available,
+        run_query_expand as _slm_run_query_expand,
+    )
 
     if not _slm_available():
         return {
@@ -1854,7 +1881,8 @@ async def notebook_query_expand(
             "fallback_tool": "search_code",
         }
 
-    nb = await _get_notebook()
+    pyghidra_context = _get_context(ctx)
+    nb = await _get_notebook(pyghidra_context)
     b = nb.binaries.get(binary_name)
     if not b:
         raise _ToolRecoverable(
@@ -1928,7 +1956,8 @@ async def notebook_rebuild_embeddings(
     Use this when ``search_code`` shows ``vec_index_complete=false`` but
     ``embed_progress >= embed_target`` (stuck) or after a model upgrade.
     """
-    nb = await _get_notebook()
+    pyghidra_context = _get_context(ctx)
+    nb = await _get_notebook(pyghidra_context)
     if not nb.vec_available:
         raise _ToolRecoverable(
             ToolErrorCode.SEMANTIC_BACKEND_UNAVAILABLE,
@@ -1994,7 +2023,8 @@ async def notebook_archive_breadcrumbs(
     stays small. If ``binary_name`` is given, only crumbs for that binary are
     archived. If ``session_id`` is given, only that session is targeted.
     """
-    nb = await _get_notebook()
+    pyghidra_context = _get_context(ctx)
+    nb = await _get_notebook(pyghidra_context)
     bid = None
     if binary_name:
         b = nb.binaries.get(binary_name)
@@ -2031,7 +2061,8 @@ async def notebook_vacuum(
     binary. Set ``run_vacuum=True`` to run SQLite ``VACUUM`` afterward, which
     rewires the DB file and requires temporary disk space (~2x the file size).
     """
-    nb = await _get_notebook()
+    pyghidra_context = _get_context(ctx)
+    nb = await _get_notebook(pyghidra_context)
     if keep_generations < 1:
         raise _ToolRecoverable(
             ToolErrorCode.INVALID_PARAMS,

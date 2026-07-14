@@ -11,7 +11,6 @@ import asyncio
 from unittest.mock import Mock
 
 import pytest
-from mcp.shared.exceptions import McpError
 
 from ghidra_nexus import mcp_tools
 from ghidra_nexus.models import (

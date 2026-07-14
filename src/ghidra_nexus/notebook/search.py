@@ -11,7 +11,6 @@ function names (high-value for symbol-driven lookups).
 from __future__ import annotations
 
 import logging
-from collections import defaultdict
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -78,7 +77,7 @@ def rrf_merge(
 
 
 def search_fts(
-    conn: "sqlite3.Connection",
+    conn: sqlite3.Connection,
     query: str,
     *,
     binary_id: int | None = None,
@@ -126,7 +125,7 @@ def search_fts(
 
 
 def search_vec(
-    conn: "sqlite3.Connection",
+    conn: sqlite3.Connection,
     query_vec: np.ndarray,
     *,
     binary_id: int | None = None,
@@ -176,7 +175,7 @@ def search_vec(
 
 
 def hybrid_search(
-    conn: "sqlite3.Connection",
+    conn: sqlite3.Connection,
     query: str,
     query_vec: np.ndarray | None,
     *,

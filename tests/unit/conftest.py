@@ -16,18 +16,19 @@ Three things this conftest guarantees for every unit test:
    cache for every subsequent test (this is what caused the
    ``test_decompile_does_not_block_other_tool_calls`` hang).
 
-The embed worker is also disabled by default — its daemon thread shares the
-notebook SQLite connection and can race the asyncio event loop in tight async
-tests. Set ``NEXUS_DISABLE_EMBED_WORKER=0`` in a specific test if you need it.
+The embed worker is also disabled by default — its daemon thread would load
+sentence-transformers and process embed_queue rows in the background, which
+slows down tight async unit tests and is unnecessary for most cache tests.
+Set ``NEXUS_DISABLE_EMBED_WORKER=0`` in a specific test if you need it.
 """
 
 import os
 
 import pytest
 
-# Disable the embed worker daemon thread during the unit suite. The daemon
-# shares the notebook SQLite connection; combined with WAL mode it can race
-# the asyncio event loop in tight async tests.
+# Disable the embed worker daemon thread during the unit suite. Background
+# embed draining is unnecessary for most cache tests and would pull in
+# sentence-transformers model loading.
 os.environ.setdefault("NEXUS_DISABLE_EMBED_WORKER", "1")
 
 

@@ -37,15 +37,13 @@ import json
 import logging
 import sqlite3
 import threading
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
 
 from ghidra_nexus.notebook import tables
-from ghidra_nexus.notebook.scale import classify_binary
 from ghidra_nexus.notebook.vec import VecStatus, try_enable_vec
-
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +119,7 @@ class Notebook:
     # ----- lifecycle ------------------------------------------------------
 
     @classmethod
-    def open(cls, path: str | Path) -> "Notebook":
+    def open(cls, path: str | Path) -> Notebook:
         """Open or create a notebook at ``path``.
 
         Idempotent: a fresh DB migrates to the latest schema; an existing DB

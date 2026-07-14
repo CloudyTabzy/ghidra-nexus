@@ -15,7 +15,6 @@ from ghidra_nexus.notebook.extractors import (
 )
 from ghidra_nexus.notebook.extractors.decompile import DecompileExtractor
 
-
 # Registry tests that mutate state use their own reset+cleanup.
 # Other tests (DecompileExtractor behavior) just depend on the session-level
 # conftest.py fixture which guarantees all families are registered.

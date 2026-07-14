@@ -272,17 +272,21 @@ def _start_infrastructure(pyghidra_context) -> None:
     watchdog.start()
     set_watchdog(watchdog)
     # Start the notebook embed worker (Phase 3) so FTS writes get drained
-    # into sqlite-vec. Best-effort: missing deps leave FTS-only mode.
+    # into sqlite-vec. The worker opens its own SQLite connection in its
+    # background thread; WAL mode lets the two connections coexist safely.
     try:
-        nexus_data_dir = getattr(pyghidra_context, "nexus_data_dir", None)
-        if nexus_data_dir:
-            from pathlib import Path as _Path
-            from ghidra_nexus.notebook.store import Notebook as _Nb
-            from ghidra_nexus.notebook.embedder import get_embedder
+        from ghidra_nexus.notebook.store import Notebook as _Notebook
+
+        nb = getattr(pyghidra_context, "_get_notebook", lambda: None)()
+        if isinstance(nb, _Notebook):
+            from ghidra_nexus import mcp_tools as _mcp_tools
             from ghidra_nexus.notebook.embed_worker import EmbedWorker
-            nb = _Nb.open(str(_Path(nexus_data_dir) / "notebook.sqlite"))
+            from ghidra_nexus.notebook.embedder import get_embedder
+
+            _mcp_tools._NOTEBOOK_SINGLETON = nb
             worker = EmbedWorker(nb, get_embedder())
             worker.start()
+            _mcp_tools._EMBED_WORKER = worker
             logger.info("notebook embed worker started (vec_available=%s)", nb.vec_available)
     except Exception as e:
         logger.debug("notebook embed worker startup failed (FTS-only): %s", e)
@@ -294,8 +298,8 @@ def _stop_infrastructure() -> None:
     Idempotent: safe to call multiple times.
     """
     from ghidra_nexus.ghidra_executor import get_executor as _ge
-    from ghidra_nexus.watchdog import get_watchdog as _gw
     from ghidra_nexus.mcp_tools import _stop_embed_worker
+    from ghidra_nexus.watchdog import get_watchdog as _gw
 
     wd = _gw()
     if wd is not None:
@@ -336,15 +340,18 @@ def init_gui_context(
     set_watchdog(watchdog)
     # Start the notebook embed worker (Phase 3)
     try:
-        nexus_data_dir = getattr(gui_context, "nexus_data_dir", None)
-        if nexus_data_dir:
-            from pathlib import Path as _Path
-            from ghidra_nexus.notebook.store import Notebook as _Nb
-            from ghidra_nexus.notebook.embedder import get_embedder
+        from ghidra_nexus.notebook.store import Notebook as _Notebook
+
+        nb = getattr(gui_context, "_get_notebook", lambda: None)()
+        if isinstance(nb, _Notebook):
+            from ghidra_nexus import mcp_tools as _mcp_tools
             from ghidra_nexus.notebook.embed_worker import EmbedWorker
-            nb = _Nb.open(str(_Path(nexus_data_dir) / "notebook.sqlite"))
+            from ghidra_nexus.notebook.embedder import get_embedder
+
+            _mcp_tools._NOTEBOOK_SINGLETON = nb
             worker = EmbedWorker(nb, get_embedder())
             worker.start()
+            _mcp_tools._EMBED_WORKER = worker
             logger.info("notebook embed worker started (vec_available=%s)", nb.vec_available)
     except Exception as e:
         logger.debug("notebook embed worker startup failed (FTS-only): %s", e)

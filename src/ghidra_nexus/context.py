@@ -12,12 +12,12 @@ from ghidra_nexus.decompiler_pool import DecompilerPool
 from ghidra_nexus.import_detection import is_ghidra_importable
 from ghidra_nexus.import_planning import ImportCandidate, build_import_plan
 from ghidra_nexus.indexing_mixin import IndexingMixin
-from ghidra_nexus.notebook import Notebook
 from ghidra_nexus.models import (
     ImportRequestResult,
     ProgramInfo as ProgramInfoModel,
     SkippedImport as SkippedImportModel,
 )
+from ghidra_nexus.notebook import Notebook
 
 if TYPE_CHECKING:
     from ghidra.base.project import GhidraProject
@@ -162,11 +162,18 @@ class PyGhidraContext(IndexingMixin):
         return self._notebook
 
     def _sync_binary_to_notebook(self, binary_name: str, program_info: ProgramInfo) -> None:
-        """Persist live function count and analysis readiness to the notebook."""
+        """Persist live function count and analysis readiness to the notebook.
+
+        The notebook key must match the user-facing canonical name returned by
+        :meth:`import_binary_backgrounded` (``filename-hash``). Domain-file
+        pathnames such as ``/find.exe-92adfe`` are normalized to the basename so
+        cache tools and CLI all read from the same row.
+        """
         nb = self._get_notebook()
         if nb is None:
             return
         try:
+            canonical_name = Path(binary_name).name
             function_count = self._safe_function_count(program_info)
             sha256 = self._safe_sha256(program_info) or ""
             size_bytes = None
@@ -176,7 +183,7 @@ class PyGhidraContext(IndexingMixin):
             except Exception:
                 size_bytes = None
             nb.binaries.upsert(
-                name=binary_name,
+                name=canonical_name,
                 sha256=sha256,
                 image_base=str(metadata.get("Image Base", "") or ""),
                 arch=str(metadata.get("Architecture", "") or ""),
@@ -184,7 +191,7 @@ class PyGhidraContext(IndexingMixin):
                 function_count=function_count,
             )
             if program_info.analysis_complete:
-                nb.binaries.mark_analysis_ready(binary_name, function_count=function_count)
+                nb.binaries.mark_analysis_ready(canonical_name, function_count=function_count)
         except Exception:
             logger.debug("Failed to sync binary %s to notebook", binary_name, exc_info=True)
 
@@ -312,14 +319,35 @@ class PyGhidraContext(IndexingMixin):
 
         Enriches each entry with live ``function_count``, ``sha256``, and
         ``entropy_summary`` so ``analysis_status`` never lies to the agent.
+
+        Notebook-first: when the binary row has already been synced, read the
+        expensive fields from SQLite instead of touching Ghidra on every poll.
+        This keeps the asyncio polling path from contending with the executor.
         """
         program_infos = []
+        # Always acquire the programs lock before touching the notebook so the
+        # lock order matches every other code path (programs lock -> notebook).
         with self._programs_lock:
             items = list(self.programs.items())
+        nb = self._get_notebook()
+        nb_rows: dict[str, dict] = {}
+        if nb is not None:
+            try:
+                rows = nb.binaries.all()
+                for row in rows:
+                    nb_rows[row.get("name")] = row
+            except Exception:
+                logger.debug("Failed to read notebook binary rows", exc_info=True)
         for name, pi in items:
+            canonical = Path(name).name
+            row = nb_rows.get(canonical) if nb_rows else None
             meta = dict(pi.metadata or {})
-            function_count = self._safe_function_count(pi)
-            sha256 = self._safe_sha256(pi)
+            if row and row.get("analysis_ready"):
+                function_count = int(row.get("function_count") or 0)
+                sha256 = row.get("sha256") or None
+            else:
+                function_count = self._safe_function_count(pi)
+                sha256 = self._safe_sha256(pi)
             if sha256:
                 meta["sha256"] = sha256
             meta["function_count"] = function_count
@@ -1070,7 +1098,11 @@ class PyGhidraContext(IndexingMixin):
             info = self.programs.get(df.pathname)
             if info is not None:
                 info.ghidra_analysis_complete = True
-                self._sync_binary_to_notebook(df.pathname, info)
+        # Sync notebook outside the programs lock to avoid a lock-order
+        # inversion with list_project_binary_infos (programs lock + notebook
+        # connection must always be acquired in the same order).
+        if info is not None:
+            self._sync_binary_to_notebook(df.pathname, info)
         return df_or_prog
 
     def set_analysis_option(  # noqa: C901

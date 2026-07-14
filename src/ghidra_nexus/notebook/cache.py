@@ -25,8 +25,7 @@ from typing import TYPE_CHECKING
 
 from ghidra_nexus.notebook.addresses import to_int, to_rva
 from ghidra_nexus.notebook.extractors import extract_for
-from ghidra_nexus.notebook.pagination import DEFAULT_LIMITS, PageWindow, clamp_limit, window_text
-from ghidra_nexus.notebook.scale import classify_binary
+from ghidra_nexus.notebook.pagination import window_text
 
 if TYPE_CHECKING:
     from ghidra_nexus.context import ProgramInfo as JvmProgramInfo
@@ -59,7 +58,7 @@ def resolve_binary_id(
     )
 
 
-def _get_image_base(program_info: "JvmProgramInfo") -> str | None:
+def _get_image_base(program_info: JvmProgramInfo) -> str | None:
     """Best-effort image_base from the Ghidra program metadata.
 
     Defensive: any non-dict metadata or non-string image_base is treated as
@@ -79,7 +78,7 @@ def _get_image_base(program_info: "JvmProgramInfo") -> str | None:
     return None
 
 
-def _get_function_count(program_info: "JvmProgramInfo") -> int | None:
+def _get_function_count(program_info: JvmProgramInfo) -> int | None:
     try:
         import ghidra_nexus.context as _ctx
 
@@ -93,7 +92,7 @@ def _source_hash(binary_sha256: str, rva: str, generation: int) -> str:
     return hashlib.sha256(f"{binary_sha256}:{rva}:{generation}".encode()).hexdigest()
 
 
-def _resolve_rva(addr: str, program_info: "JvmProgramInfo") -> str:
+def _resolve_rva(addr: str, program_info: JvmProgramInfo) -> str:
     """Convert an agent-supplied address (or symbol name) to canonical RVA.
 
     Symbol names (e.g. ``"main"``) cannot be converted to an RVA at the cache

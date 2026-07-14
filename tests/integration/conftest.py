@@ -47,14 +47,29 @@ def ghidra_env():
     env = os.environ.copy()
     ghidra_dir = env.get("GHIDRA_INSTALL_DIR")
     if ghidra_dir and os.path.isdir(ghidra_dir):
-        return env
-    if os.path.isdir("/ghidra"):
+        pass
+    elif os.path.isdir("/ghidra"):
         env["GHIDRA_INSTALL_DIR"] = "/ghidra"
-        return env
-    pytest.skip(
-        "GHIDRA installation not found. Set GHIDRA_INSTALL_DIR to a valid Ghidra install, "
-        "or ensure /ghidra exists."
+    else:
+        pytest.skip(
+            "GHIDRA installation not found. Set GHIDRA_INSTALL_DIR to a valid Ghidra install, "
+            "or ensure /ghidra exists."
+        )
+
+    # Prefer a local sentence-transformers model cache when available. Downloading
+    # all-MiniLM-L6-v2 from HuggingFace during the E2E test is slow and can hang
+    # behind restrictive networks, so point the runtime at any pre-populated cache.
+    local_embed_cache = env.get("NEXUS_EMBED_CACHE_DIR") or (
+        Path(os.environ.get("LOCALAPPDATA", "C:/Windows/Temp"))
+        / "Programs"
+        / "klee-kernel"
+        / "embed_model"
     )
+    if local_embed_cache and Path(local_embed_cache).is_dir():
+        env["SENTENCE_TRANSFORMERS_HOME"] = str(local_embed_cache)
+        env.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
+    return env
 
 
 @pytest.fixture(scope="module")

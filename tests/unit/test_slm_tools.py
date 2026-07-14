@@ -12,9 +12,7 @@ The actual SLM invocation is exercised in the integration suite
 
 from __future__ import annotations
 
-import asyncio
-import os
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import Mock
 
 import pytest
 

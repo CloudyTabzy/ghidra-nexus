@@ -15,18 +15,10 @@ should run that with a real model on the integration E2E harness.
 
 from __future__ import annotations
 
-import asyncio
-import json
-import os
-from dataclasses import dataclass, field
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
-
-import pytest
+from unittest.mock import Mock
 
 from ghidra_nexus.slm import is_available, model_status
 from ghidra_nexus.slm.grounding import (
-    GroundingResult,
     validate_api_name,
     validate_fts_query,
     validate_identifier,
@@ -40,18 +32,10 @@ from ghidra_nexus.slm.prompts import (
     build_summarize_prompt,
 )
 from ghidra_nexus.slm.tasks import (
-    CallgraphExplanation,
     ExpandedQuery,
-    NameCandidate,
-    SuggestNameResult,
-    SummarizeResult,
     _extract_json,
-    run_explain_callgraph,
     run_query_expand,
-    run_suggest_name,
-    run_summarize,
 )
-
 
 # ===========================================================================
 # Grounding validators
@@ -353,7 +337,6 @@ class TestRunQueryExpandWithMockedSLM:
         )
 
     def test_success(self, monkeypatch):
-        from ghidra_nexus.slm.tasks import run_query_expand
         monkeypatch.setattr(
             "ghidra_nexus.slm.tasks._invoke_slm",
             self._fake_invoke,
@@ -377,7 +360,6 @@ class TestRunQueryExpandWithMockedSLM:
         assert result.model == "fake-model"
 
     def test_grounding_rejects_unknown_apis(self, monkeypatch):
-        from ghidra_nexus.slm.tasks import run_query_expand
 
         def fake_invoke(prompt, **kw):
             return (
@@ -401,7 +383,6 @@ class TestRunQueryExpandWithMockedSLM:
         assert "socket" in result.related_apis
 
     def test_invalid_fts_falls_back_to_tokens(self, monkeypatch):
-        from ghidra_nexus.slm.tasks import run_query_expand
 
         def fake_invoke(prompt, **kw):
             # Unbalanced quote in fts_query — should fall back to tokens
@@ -427,7 +408,6 @@ class TestRunQueryExpandWithMockedSLM:
         assert "malloc" in result.fts_query or "free" in result.fts_query
 
     def test_invalid_json_falls_back_to_heuristic(self, monkeypatch):
-        from ghidra_nexus.slm.tasks import run_query_expand
 
         def fake_invoke(prompt, **kw):
             return ("plain text no json", 10)
@@ -450,13 +430,11 @@ class TestRunQueryExpandWithMockedSLM:
         assert "fallback heuristic" in result.rationale
 
     def test_empty_query(self):
-        from ghidra_nexus.slm.tasks import run_query_expand
         result = run_query_expand(binary_name="x", query="")
         assert result.tokens == []
         assert result.fts_query == ""
 
     def test_token_count_capped_at_max(self, monkeypatch):
-        from ghidra_nexus.slm.tasks import run_query_expand
 
         def fake_invoke(prompt, **kw):
             # 30 tokens returned, max_tokens=10

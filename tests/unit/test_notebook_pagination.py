@@ -7,7 +7,6 @@ import pytest
 from ghidra_nexus.notebook.pagination import (
     DEFAULT_LIMITS,
     MAX_LIMITS,
-    PageWindow,
     clamp_limit,
     validate_offset,
     window_list,

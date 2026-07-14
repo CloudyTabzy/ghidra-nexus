@@ -7,8 +7,6 @@ These don't need Ghidra. Real Ghidra integration is tested in
 from __future__ import annotations
 
 import math
-import os
-import string
 
 import pytest
 

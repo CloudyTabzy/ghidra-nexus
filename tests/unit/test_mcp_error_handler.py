@@ -8,8 +8,8 @@ import pytest
 
 from ghidra_nexus.errors import ProgramAccessError, ToolErrorCode
 from ghidra_nexus.mcp_tools import (
-    _ToolRecoverable,
     _as_tool_error_dict,
+    _ToolRecoverable,
     decompile_function,
     delete_project_binary,
     disassemble,

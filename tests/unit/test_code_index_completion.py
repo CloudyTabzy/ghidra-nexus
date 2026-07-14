@@ -12,7 +12,6 @@ Phase 3 demotion: chromadb is opt-in via NEXUS_SEMANTIC_BACKEND=chromadb. Each
 test sets the env var for its lifetime so the client is initialized.
 """
 
-import os
 
 import pytest
 

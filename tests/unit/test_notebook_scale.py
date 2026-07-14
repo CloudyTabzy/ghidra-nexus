@@ -5,9 +5,6 @@ from __future__ import annotations
 import pytest
 
 from ghidra_nexus.notebook.scale import (
-    _SMALL_FUNCS,
-    _MEDIUM_FUNCS,
-    _LARGE_FUNCS,
     BinaryScale,
     classify_binary,
 )

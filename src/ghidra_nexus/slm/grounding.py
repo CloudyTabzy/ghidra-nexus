@@ -125,8 +125,7 @@ _API_CATALOG: frozenset[str] = frozenset(
         # Synchronization
         "EnterCriticalSection", "LeaveCriticalSection",
         "InitializeCriticalSection", "DeleteCriticalSection",
-        "CreateEvent", "SetEvent", "ResetEvent", "WaitForSingleObject",
-        "CreateSemaphore", "ReleaseSemaphore",
+        "CreateEvent", "SetEvent", "ResetEvent", "CreateSemaphore", "ReleaseSemaphore",
         "InterlockedCompareExchange", "InterlockedExchange",
         "InterlockedIncrement", "InterlockedDecrement",
         # Strings

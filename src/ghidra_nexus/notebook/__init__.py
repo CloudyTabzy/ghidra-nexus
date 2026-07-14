@@ -6,8 +6,8 @@ It owns one SQLite file per project and exposes sub-managers for every table.
 
 from .addresses import normalize_hex, parse_addr_token, to_int, to_rva, to_va
 from .pagination import (
-    MAX_LIMITS,
     DEFAULT_LIMITS,
+    MAX_LIMITS,
     PageWindow,
     clamp_limit,
     validate_offset,

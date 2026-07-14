@@ -174,7 +174,6 @@ def model_status() -> dict:
 
     Reports whether the model is configured, loaded, and what it is.
     """
-    import os
 
     cfg = _read_config_from_env()
     return {

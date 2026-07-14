@@ -4,7 +4,7 @@ import threading
 import time
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ghidra_nexus.context import ProgramInfo
 from ghidra_nexus.decompiler_pool import DecompilerPool
@@ -17,6 +17,9 @@ from ghidra_nexus.models import (
     SkippedImport as SkippedImportModel,
 )
 from ghidra_nexus.project_spec import ProjectSpec
+
+if TYPE_CHECKING:
+    from ghidra_nexus.notebook.store import Notebook
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +87,7 @@ class GuiPyGhidraContext(IndexingMixin):
         self.programs: dict[str, ProgramInfo] = {}
         self._programs_lock = threading.RLock()
         self.import_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._notebook: Notebook | None = None
         self._init_indexing_state(self.nexus_data_dir, threaded=True)
 
         self.project = self.wait_for_gui_ready(
@@ -165,6 +169,18 @@ class GuiPyGhidraContext(IndexingMixin):
                     continue
 
                 self._sync_program_info(program_info, program)
+
+    def _get_notebook(self) -> "Notebook | None":
+        """Lazily open the project's notebook SQLite database."""
+        if self._notebook is not None:
+            return self._notebook
+        try:
+            from ghidra_nexus.notebook.store import Notebook
+
+            self._notebook = Notebook.open(self.nexus_data_dir / "notebook.sqlite")
+        except Exception:
+            logger.debug("Failed to open notebook at %s", self.nexus_data_dir, exc_info=True)
+        return self._notebook
 
     def list_binaries(self) -> list[str]:
         return [df.getPathname() for df in self.list_binary_domain_files()]

@@ -68,9 +68,10 @@ def server_params(find_exe_path, ghidra_env, phase5_project_args):
     race observed with ``--no-threaded``.
     """
     # Cap the JVM heap so a memory-pressured test host still has native
-    # memory left for Ghidra's analysis and PDB symbol handling.
+    # memory left for Ghidra's analysis, PDB symbol handling, and the
+    # sentence-transformers model loaded by the embed worker.
     env = dict(ghidra_env)
-    env.setdefault("JAVA_TOOL_OPTIONS", "-Xmx1536m")
+    env.setdefault("JAVA_TOOL_OPTIONS", "-Xmx3072m")
     return StdioServerParameters(
         command="python",
         args=[

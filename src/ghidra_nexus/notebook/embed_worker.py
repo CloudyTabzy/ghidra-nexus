@@ -29,7 +29,11 @@ logger = logging.getLogger(__name__)
 class EmbedWorker:
     """Background embedder drain."""
 
-    def __init__(self, nb: "Notebook", embedder: "Embedder"):
+    def __init__(self, nb: Notebook, embedder: Embedder):
+        # ``nb`` is only used for its path. The worker opens its own SQLite
+        # connection in the background thread so it never races the main thread
+        # for the same connection object (SQLite connections are not fully
+        # thread-safe even with ``check_same_thread=False``).
         self.nb = nb
         self.embedder = embedder
         self._thread: threading.Thread | None = None
@@ -45,10 +49,6 @@ class EmbedWorker:
         if self._running:
             return
         self._running = True
-        # Ensure vec0 table exists on the connection.
-        from ghidra_nexus.notebook.vec import ensure_vec0_table
-
-        ensure_vec0_table(self.nb.conn)
         self._thread = threading.Thread(target=self._run, name="embed-worker", daemon=True)
         self._thread.start()
         logger.info("embed worker started")
@@ -60,40 +60,68 @@ class EmbedWorker:
 
     def _run(self) -> None:
         """Process queue items until stopped or queue is empty."""
+        from ghidra_nexus.notebook.store import Notebook
+        from ghidra_nexus.notebook.vec import ensure_vec0_table
+
+        # Open a dedicated connection for this background thread. WAL mode lets
+        # this coexist safely with the main thread's notebook connection.
+        try:
+            nb = Notebook.open(str(self.nb.cfg.path))
+            ensure_vec0_table(nb.conn)
+            logger.info("embed worker using dedicated notebook connection")
+        except Exception as e:
+            logger.error("embed worker failed to open notebook connection: %s", e)
+            self._running = False
+            return
+
         while self._running:
             # Load model lazily
             if not self.embedder.available:
+                logger.info("embed worker loading embedder model ...")
                 if not self.embedder.load():
                     logger.warning("embedder failed to load; worker idle")
                     time.sleep(30)
                     continue
+                logger.info("embed worker embedder loaded")
 
-            items = self.nb.embed_queue.pending()
-            if not items:
-                # Queue empty — check if we should mark binaries complete
-                self._try_mark_complete()
+            try:
+                items = nb.embed_queue.pending()
+            except Exception as e:
+                logger.warning("embed worker failed to read queue: %s", e)
                 time.sleep(5)
                 continue
 
+            if not items:
+                # Queue empty — check if we should mark binaries complete
+                self._try_mark_complete(nb)
+                time.sleep(5)
+                continue
+
+            logger.info("embed worker processing %d pending item(s)", len(items))
             for item in items:
                 if not self._running:
                     break
                 try:
-                    self._process_one(item)
+                    self._process_one(item, nb)
                     self._total_processed += 1
                 except Exception as e:
                     self._total_errors += 1
-                    self.nb.embed_queue.mark_error(item["id"], str(e))
-                    logger.debug("embed worker error on queue %d: %s", item["id"], e)
+                    nb.embed_queue.mark_error(item["id"], str(e))
+                    logger.warning("embed worker error on queue %d: %s", item["id"], e)
 
-    def _process_one(self, item: dict) -> None:
+        try:
+            nb.close()
+        except Exception:
+            pass
+
+    def _process_one(self, item: dict, nb: Notebook) -> None:
         """Embed a single queue item."""
         src_view_id = item["src_view_id"]
-        view_row = self.nb.conn.execute(
+        view_row = nb.conn.execute(
             "SELECT * FROM artifact_views WHERE id = ?", (src_view_id,)
         ).fetchone()
         if view_row is None:
-            self.nb.embed_queue.mark_done(item["id"])
+            nb.embed_queue.mark_done(item["id"])
             return
 
         view = dict(view_row)
@@ -112,7 +140,7 @@ class EmbedWorker:
 
         vec = self.embedder.encode(text)
         if vec is None:
-            self.nb.embed_queue.mark_error(item["id"], "embedder returned None")
+            nb.embed_queue.mark_error(item["id"], "embedder returned None")
             return
 
         import struct
@@ -122,7 +150,7 @@ class EmbedWorker:
         # Insert meta row
         from ghidra_nexus.notebook.vec import EMBED_DIM, EMBED_MODEL_ID
 
-        eid = self.nb.embeddings.insert(
+        eid = nb.embeddings.insert(
             binary_id=binary_id,
             rva=rva,
             kind=kind,
@@ -137,38 +165,42 @@ class EmbedWorker:
         # Insert into vec0
         from ghidra_nexus.notebook.vec import insert_vec
 
-        insert_vec(self.nb.conn, rowid=eid, vec=vec, dim=EMBED_DIM)
+        insert_vec(nb.conn, rowid=eid, vec=vec, dim=EMBED_DIM)
 
         # Update embeddings row with vec_rowid link back
-        self.nb.conn.execute(
+        nb.conn.execute(
             "UPDATE embeddings SET vec_rowid = ? WHERE id = ?", (eid, eid)
         )
 
-        self.nb.embed_queue.mark_done(item["id"])
+        nb.embed_queue.mark_done(item["id"])
         logger.debug("embed worker processed view %d → embedding %d", src_view_id, eid)
 
-    def _try_mark_complete(self) -> None:
+    def _try_mark_complete(self, nb: Notebook) -> None:
         """If all embed_queue items are done/skipped/error, mark binaries complete."""
         # Check if there are ANY pending items
-        pending = self.nb.conn.execute(
+        pending = nb.conn.execute(
             "SELECT COUNT(*) FROM embed_queue WHERE status = 'pending'"
         ).fetchone()[0]
         if pending > 0:
             return
 
         # Mark each binary that has embeddings
-        binaries = self.nb.binaries.all()
+        binaries = nb.binaries.all()
         from ghidra_nexus.notebook.vec import EMBED_MODEL_ID
 
         for b in binaries:
-            embedded_count = self.nb.embeddings.count_for_binary(b["id"])
-            views_count = self.nb.views.count_for_binary(b["id"])
+            embedded_count = nb.embeddings.count_for_binary(b["id"])
+            views_count = nb.views.count_for_binary(b["id"])
             if views_count > 0 and embedded_count >= views_count:
-                self.nb.binaries.set_vec_status(
+                nb.binaries.set_vec_status(
                     b["name"],
                     vec_available=True,
                     model=EMBED_MODEL_ID,
                     index_complete=True,
                     progress=embedded_count,
                     target=views_count,
+                )
+                logger.info(
+                    "embed worker marked %s vec_index_complete (%d/%d)",
+                    b["name"], embedded_count, views_count,
                 )

@@ -10,7 +10,7 @@ from __future__ import annotations
 import gzip
 import json
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from ghidra_nexus.notebook.pagination import clamp_limit, validate_offset, window_list
 from ghidra_nexus.notebook.scale import classify_binary

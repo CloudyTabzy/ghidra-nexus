@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -104,6 +103,13 @@ class TestBinariesManager:
         nb.binaries.mark_analysis_ready("f.exe")
         b = nb.binaries.get("f.exe")
         assert b["analysis_ready"] == 1
+
+    def test_mark_analysis_ready_updates_function_count(self, nb):
+        nb.binaries.upsert(name="f.exe", sha256="s", function_count=0)
+        nb.binaries.mark_analysis_ready("f.exe", function_count=42)
+        b = nb.binaries.get("f.exe")
+        assert b["analysis_ready"] == 1
+        assert b["function_count"] == 42
 
 
 class TestFunctionsManager:

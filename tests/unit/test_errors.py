@@ -9,11 +9,11 @@ from __future__ import annotations
 import pytest
 
 from ghidra_nexus.errors import (
+    _FALLBACK_TOOL,
     REGISTERED_TOOL_NAMES,
     ProgramAccessError,
     ToolError,
     ToolErrorCode,
-    _FALLBACK_TOOL,
     classify_decompile_failure,
     classify_lookup_failure,
     decompile_failure_result,

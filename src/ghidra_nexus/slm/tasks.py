@@ -17,11 +17,9 @@ import json
 import logging
 import re
 import time
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 from ghidra_nexus.slm.grounding import (
-    GroundingResult,
     validate_api_name,
     validate_fts_query,
     validate_identifier,

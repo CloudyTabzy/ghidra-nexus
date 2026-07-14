@@ -7,7 +7,7 @@ Pure-Python — uses :mod:`math` only; no numpy, no platform deps.
 from __future__ import annotations
 
 import math
-from typing import Iterable
+from collections.abc import Iterable
 
 from ghidra_nexus.models import SectionClassification, SectionRecommendation
 
