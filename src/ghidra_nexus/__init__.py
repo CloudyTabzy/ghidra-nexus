@@ -16,35 +16,49 @@ _LAZY_MODULES: dict[str, str] = {
     "PyGhidraContext": "ghidra_nexus.context",
     "ProgramInfo": "ghidra_nexus.context",
     "GhidraTools": "ghidra_nexus.tools",
+    "Notebook": "CLASS:ghidra_nexus.notebook",
 }
 
 
 def __getattr__(name: str):
-    """Lazy-load heavy submodules to avoid pulling in chromadb/pyghidra at import time.
+    """Lazy-load heavy submodules or classes to avoid pulling in chromadb/pyghidra
+    at import time.
 
-    Implementation note: we use ``sys.modules.get()`` instead of ``from . import server``
-    so a partial-package import state doesn't recurse via ``__getattr__`` itself. The
-    previous implementation hit a ``RecursionError`` whenever a sibling submodule did
-    ``from ghidra_nexus import server`` (which is the natural form inside server.py's
-    companions). Touching ``sys.modules`` directly short-circuits the recursion.
+    Entries in ``_LAZY_MODULES`` whose value starts with ``CLASS:`` are treated as
+    class-level exports (e.g. ``Notebook`` → the :class:`~ghidra_nexus.notebook.Notebook`
+    class). Otherwise the value is treated as a module fullname and the *module* is
+    returned.
     """
     import sys as _sys
 
-    fullname = _LAZY_MODULES.get(name)
-    if fullname is None:
-        if name == "Notebook":
-            # Phase-1 surface; surface a clear error until the notebook ships.
-            raise AttributeError(
-                "ghidra_nexus.Notebook is not yet implemented (Phase 1+ in "
-                "Implementations/phase-1-foundation.md)."
-            )
+    spec = _LAZY_MODULES.get(name)
+    if spec is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    mod = _sys.modules.get(fullname)
+
+    if spec.startswith("CLASS:"):
+        module_name = spec.removeprefix("CLASS:")
+        mod = _sys.modules.get(module_name)
+        if mod is None:
+            import importlib
+
+            mod = importlib.import_module(module_name)
+        # The class name is ``name`` by convention — import it.
+        try:
+            value = getattr(mod, name)
+        except AttributeError as e:
+            raise AttributeError(
+                f"ghidra_nexus: lazy class {name!r} not found in {module_name}"
+            ) from e
+        _sys.modules[__name__].__dict__[name] = value
+        return value
+
+    # Module-level lazy import (current convention).
+    mod = _sys.modules.get(spec)
     if mod is not None:
         return mod
     import importlib
 
-    mod = importlib.import_module(fullname)
+    mod = importlib.import_module(spec)
     _sys.modules[__name__].__dict__[name] = mod  # cache on the package
     return mod
 

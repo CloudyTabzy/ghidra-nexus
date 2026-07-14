@@ -55,6 +55,7 @@ clean:
 build:
 	uv build
 
-# Phase-1 placeholder: opens the notebook SQLite at the project root and prints schema version.
+# Phase-1: open the notebook SQLite at the default project path. Prints schema version,
+# table list, binary count, and vec status.
 notebook-init:
-	uv run python -c "import sqlite3, pathlib; p=pathlib.Path('ghidra_nexus_projects/my_project-nexus/notebook.sqlite'); p.parent.mkdir(parents=True, exist_ok=True); c=sqlite3.connect(p); c.execute('PRAGMA user_version'); print('notebook db:', p, 'user_version=', c.execute('PRAGMA user_version').fetchone()[0]); c.close()"
+	uv run python -c "from ghidra_nexus.notebook import Notebook; p='ghidra_nexus_projects/my_project-nexus/notebook.sqlite'; nb=Notebook.open(p); print('path:', nb.cfg.path); print('user_version:', nb._user_version()); print('vec_available:', nb.vec_available); print('binaries:', nb.binaries.count()); nb.close()"

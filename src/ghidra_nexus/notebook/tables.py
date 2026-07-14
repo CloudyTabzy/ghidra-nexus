@@ -1,0 +1,810 @@
+"""Sub-managers for every notebook table.
+
+Each class in this module owns one SQLite table. Methods that write go through
+``self.nb.transaction()``; methods that only read use ``self.nb.conn.execute``
+directly so concurrent reads never block on the write lock.
+"""
+
+from __future__ import annotations
+
+import gzip
+import json
+import time
+from typing import TYPE_CHECKING, Any
+
+from ghidra_nexus.notebook.pagination import clamp_limit, validate_offset, window_list
+from ghidra_nexus.notebook.scale import classify_binary
+
+if TYPE_CHECKING:
+    import sqlite3
+
+    from ghidra_nexus.notebook.store import Notebook
+
+
+# ---------------------------------------------------------------------------
+# helpers shared by sub-managers
+# ---------------------------------------------------------------------------
+
+def _gz_compress(text: str) -> bytes:
+    return gzip.compress(text.encode("utf-8"), compresslevel=6)
+
+
+def _gz_decompress(blob: bytes) -> str:
+    return gzip.decompress(blob).decode("utf-8")
+
+
+def _json_serialize(obj: object) -> str:
+    return json.dumps(obj, ensure_ascii=False, default=str)
+
+
+# ---------------------------------------------------------------------------
+# binaries
+# ---------------------------------------------------------------------------
+
+class BinariesManager:
+    __slots__ = ("nb",)
+
+    def __init__(self, nb: Notebook):
+        self.nb = nb
+
+    def upsert(
+        self,
+        *,
+        name: str,
+        sha256: str,
+        image_base: str | None = None,
+        arch: str | None = None,
+        size_bytes: int | None = None,
+        function_count: int | None = None,
+    ) -> int:
+        scale = classify_binary(size_bytes=size_bytes, function_count=function_count)
+        with self.nb.transaction() as conn:
+            conn.execute(
+                """INSERT INTO binaries (name, sha256, image_base, arch, size_bytes,
+                   function_count, binary_class, reliability_notes, last_analyzed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(name) DO UPDATE SET
+                   sha256 = excluded.sha256,
+                   image_base = COALESCE(excluded.image_base, binaries.image_base),
+                   arch = COALESCE(excluded.arch, binaries.arch),
+                   size_bytes = COALESCE(excluded.size_bytes, binaries.size_bytes),
+                   function_count = COALESCE(excluded.function_count, binaries.function_count),
+                   binary_class = excluded.binary_class,
+                   reliability_notes = excluded.reliability_notes,
+                   last_analyzed_at = CURRENT_TIMESTAMP""",
+                (
+                    name,
+                    sha256,
+                    image_base,
+                    arch,
+                    size_bytes,
+                    function_count or 0,
+                    scale.binary_class,
+                    _json_serialize(scale.reliability_notes),
+                ),
+            )
+            row = conn.execute("SELECT id FROM binaries WHERE name = ?", (name,)).fetchone()
+        assert row is not None
+        return row[0]
+
+    def get(self, name: str) -> dict | None:
+        row = self.nb.conn.execute(
+            "SELECT * FROM binaries WHERE name = ?", (name,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_by_id(self, bid: int) -> dict | None:
+        row = self.nb.conn.execute(
+            "SELECT * FROM binaries WHERE id = ?", (bid,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def all(self) -> list[dict]:
+        return [
+            dict(r)
+            for r in self.nb.conn.execute("SELECT * FROM binaries ORDER BY name")
+        ]
+
+    def count(self) -> int:
+        return self.nb.conn.execute("SELECT COUNT(*) FROM binaries").fetchone()[0]
+
+    def bump_generation(self, binary_name: str) -> int:
+        with self.nb.transaction() as conn:
+            conn.execute(
+                "UPDATE binaries SET analysis_generation = analysis_generation + 1 WHERE name = ?",
+                (binary_name,),
+            )
+            row = conn.execute(
+                "SELECT analysis_generation FROM binaries WHERE name = ?", (binary_name,)
+            ).fetchone()
+        return row[0] if row else 0
+
+    def mark_analysis_ready(self, binary_name: str) -> None:
+        with self.nb.transaction() as conn:
+            conn.execute(
+                "UPDATE binaries SET analysis_ready = 1, last_analyzed_at = CURRENT_TIMESTAMP WHERE name = ?",
+                (binary_name,),
+            )
+
+    def set_vec_status(
+        self,
+        binary_name: str,
+        *,
+        vec_available: bool,
+        model: str | None = None,
+        index_complete: bool = False,
+        progress: int | None = None,
+        target: int | None = None,
+    ) -> None:
+        with self.nb.transaction() as conn:
+            conn.execute(
+                """UPDATE binaries SET
+                   vec_status = ?,
+                   vec_index_complete = ?,
+                   embed_progress = ?,
+                   embed_target = ?,
+                   embed_model = ?
+                   WHERE name = ?""",
+                (
+                    "ready" if (vec_available and index_complete) else ("fts_only" if not vec_available else "rebuilding"),
+                    1 if index_complete else 0,
+                    progress if progress is not None else 0,
+                    target if target is not None else 0,
+                    model,
+                    binary_name,
+                ),
+            )
+
+
+# ---------------------------------------------------------------------------
+# functions
+# ---------------------------------------------------------------------------
+
+class FunctionsManager:
+    __slots__ = ("nb",)
+
+    def __init__(self, nb: Notebook):
+        self.nb = nb
+
+    def upsert(
+        self,
+        *,
+        binary_id: int,
+        rva: str,
+        name: str | None = None,
+        size: int | None = None,
+        signature: str | None = None,
+        quality: str = "unknown",
+        flags: dict | None = None,
+    ) -> None:
+        with self.nb.transaction() as conn:
+            conn.execute(
+                """INSERT INTO functions (binary_id, rva, name, size, signature,
+                   quality, flags, first_seen, last_seen)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                   ON CONFLICT(binary_id, rva) DO UPDATE SET
+                   name = COALESCE(excluded.name, functions.name),
+                   size = COALESCE(excluded.size, functions.size),
+                   signature = COALESCE(excluded.signature, functions.signature),
+                   quality = excluded.quality,
+                   flags = COALESCE(excluded.flags, functions.flags),
+                   last_seen = CURRENT_TIMESTAMP""",
+                (binary_id, rva, name, size, signature, quality, _json_serialize(flags) if flags else None),
+            )
+
+    def get(self, binary_id: int, rva: str) -> dict | None:
+        row = self.nb.conn.execute(
+            "SELECT * FROM functions WHERE binary_id = ? AND rva = ?", (binary_id, rva)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list(
+        self, binary_id: int, *, offset: int = 0, limit: int = 0
+    ) -> list[dict]:
+        limit = clamp_limit("functions", limit) if limit else 100
+        offset = validate_offset("functions", offset)
+        return [
+            dict(r)
+            for r in self.nb.conn.execute(
+                "SELECT * FROM functions WHERE binary_id = ? ORDER BY rva LIMIT ? OFFSET ?",
+                (binary_id, limit, offset),
+            )
+        ]
+
+    def count(self, binary_id: int) -> int:
+        row = self.nb.conn.execute(
+            "SELECT COUNT(*) FROM functions WHERE binary_id = ?", (binary_id,)
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def set_quality(self, binary_id: int, rva: str, quality: str) -> None:
+        with self.nb.transaction() as conn:
+            conn.execute(
+                "UPDATE functions SET quality = ?, last_seen = CURRENT_TIMESTAMP WHERE binary_id = ? AND rva = ?",
+                (quality, binary_id, rva),
+            )
+
+
+# ---------------------------------------------------------------------------
+# decompiles
+# ---------------------------------------------------------------------------
+
+class DecompilesManager:
+    __slots__ = ("nb",)
+
+    def __init__(self, nb: Notebook):
+        self.nb = nb
+
+    def put(
+        self,
+        *,
+        binary_id: int,
+        rva: str,
+        code: str,
+        lines: int,
+        warnings: list | None = None,
+        source_hash: str | None = None,
+        analysis_generation: int = 0,
+    ) -> int:
+        blob = _gz_compress(code)
+        with self.nb.transaction() as conn:
+            conn.execute(
+                """INSERT INTO decompiles (binary_id, rva, code, lines, warnings,
+                   source_hash, analysis_generation)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (binary_id, rva, blob, lines, _json_serialize(warnings) if warnings else None, source_hash, analysis_generation),
+            )
+            row = conn.execute("SELECT last_insert_rowid()").fetchone()
+        return int(row[0]) if row else 0
+
+    def get(self, binary_id: int, rva: str) -> dict | None:
+        row = self.nb.conn.execute(
+            """SELECT * FROM decompiles WHERE binary_id = ? AND rva = ?
+               ORDER BY analysis_generation DESC LIMIT 1""",
+            (binary_id, rva),
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        try:
+            result["code_text"] = _gz_decompress(result["code"])
+        except Exception:
+            result["code_text"] = ""
+        return result
+
+    def get_generation(self, binary_id: int, rva: str, gen: int) -> dict | None:
+        row = self.nb.conn.execute(
+            "SELECT * FROM decompiles WHERE binary_id = ? AND rva = ? AND analysis_generation = ?",
+            (binary_id, rva, gen),
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        try:
+            result["code_text"] = _gz_decompress(result["code"])
+        except Exception:
+            result["code_text"] = ""
+        return result
+
+    def count_for_binary(self, binary_id: int) -> int:
+        row = self.nb.conn.execute(
+            "SELECT COUNT(*) FROM decompiles WHERE binary_id = ?", (binary_id,)
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+
+# ---------------------------------------------------------------------------
+# disassemblies
+# ---------------------------------------------------------------------------
+
+class DisassembliesManager:
+    __slots__ = ("nb",)
+
+    def __init__(self, nb: Notebook):
+        self.nb = nb
+
+    def put(
+        self,
+        *,
+        binary_id: int,
+        rva: str,
+        asm: str,
+        instruction_count: int,
+        analysis_generation: int = 0,
+    ) -> int:
+        blob = _gz_compress(asm)
+        with self.nb.transaction() as conn:
+            conn.execute(
+                """INSERT INTO disassemblies (binary_id, rva, asm, instruction_count, analysis_generation)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (binary_id, rva, blob, instruction_count, analysis_generation),
+            )
+            row = conn.execute("SELECT last_insert_rowid()").fetchone()
+        return int(row[0]) if row else 0
+
+    def get(self, binary_id: int, rva: str) -> dict | None:
+        row = self.nb.conn.execute(
+            """SELECT * FROM disassemblies WHERE binary_id = ? AND rva = ?
+               ORDER BY analysis_generation DESC LIMIT 1""",
+            (binary_id, rva),
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        try:
+            result["asm_text"] = _gz_decompress(result["asm"])
+        except Exception:
+            result["asm_text"] = ""
+        return result
+
+    def count_for_binary(self, binary_id: int) -> int:
+        row = self.nb.conn.execute(
+            "SELECT COUNT(*) FROM disassemblies WHERE binary_id = ?", (binary_id,)
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+
+# ---------------------------------------------------------------------------
+# xrefs
+# ---------------------------------------------------------------------------
+
+class XrefsManager:
+    __slots__ = ("nb",)
+
+    def __init__(self, nb: Notebook):
+        self.nb = nb
+
+    def bulk_replace_for_target(
+        self, binary_id: int, to_rva: str, refs: list[dict]
+    ) -> None:
+        with self.nb.transaction() as conn:
+            conn.execute(
+                "DELETE FROM xrefs WHERE binary_id = ? AND to_rva = ?",
+                (binary_id, to_rva),
+            )
+            conn.executemany(
+                "INSERT INTO xrefs (binary_id, from_rva, to_rva, xref_type, call_site) VALUES (?, ?, ?, ?, ?)",
+                [
+                    (binary_id, r["from_rva"], r["to_rva"], r["xref_type"], r.get("call_site"))
+                    for r in refs
+                ],
+            )
+
+    def list_to(self, binary_id: int, rva: str, *, offset: int = 0, limit: int = 50) -> dict:
+        limit = clamp_limit("xrefs", limit)
+        offset = validate_offset("xrefs", offset)
+        rows = self.nb.conn.execute(
+            "SELECT * FROM xrefs WHERE binary_id = ? AND to_rva = ?",
+            (binary_id, rva),
+        ).fetchall()
+        return window_list([dict(r) for r in rows], offset=offset, limit=limit)
+
+    def count_to(self, binary_id: int, rva: str) -> int:
+        row = self.nb.conn.execute(
+            "SELECT COUNT(*) FROM xrefs WHERE binary_id = ? AND to_rva = ?", (binary_id, rva)
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+
+# ---------------------------------------------------------------------------
+# strings
+# ---------------------------------------------------------------------------
+
+class StringsManager:
+    __slots__ = ("nb",)
+
+    def __init__(self, nb: Notebook):
+        self.nb = nb
+
+    def bulk_upsert(self, binary_id: int, strings: list[dict]) -> None:
+        with self.nb.transaction() as conn:
+            conn.executemany(
+                """INSERT OR REPLACE INTO strings (binary_id, rva, text, encoding, length)
+                   VALUES (?, ?, ?, ?, ?)""",
+                [
+                    (binary_id, s["rva"], s["text"], s.get("encoding", "ascii"), s.get("length", len(s["text"])))
+                    for s in strings
+                ],
+            )
+
+    def search_like(
+        self, binary_id: int, pattern: str, *, offset: int = 0, limit: int = 100
+    ) -> dict:
+        limit = clamp_limit("strings", limit)
+        offset = validate_offset("strings", offset)
+        rows = self.nb.conn.execute(
+            "SELECT * FROM strings WHERE binary_id = ? AND text LIKE ?",
+            (binary_id, f"%{pattern}%"),
+        ).fetchall()
+        return window_list([dict(r) for r in rows], offset=offset, limit=limit)
+
+
+# ---------------------------------------------------------------------------
+# breadcrumbs
+# ---------------------------------------------------------------------------
+
+class BreadcrumbsManager:
+    __slots__ = ("nb",)
+
+    def __init__(self, nb: Notebook):
+        self.nb = nb
+
+    def insert(
+        self,
+        *,
+        binary_id: int | None = None,
+        session_id: str,
+        tool: str,
+        args_hash: str | None = None,
+        summary: str = "",
+        rva: str | None = None,
+        duration_ms: int | None = None,
+        truncated: bool = False,
+        error_code: str | None = None,
+    ) -> int:
+        with self.nb.transaction() as conn:
+            conn.execute(
+                """INSERT INTO breadcrumbs (binary_id, session_id, tool, args_hash,
+                   summary, rva, duration_ms, truncated, error_code)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (binary_id, session_id, tool, args_hash, summary[:256], rva, duration_ms, 1 if truncated else 0, error_code),
+            )
+            row = conn.execute("SELECT last_insert_rowid()").fetchone()
+        return int(row[0]) if row else 0
+
+    def recent(
+        self,
+        *,
+        binary_id: int | None = None,
+        session_id: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict]:
+        limit = clamp_limit("breadcrumbs", limit)
+        offset = validate_offset("breadcrumbs", offset)
+        sql = "SELECT * FROM breadcrumbs WHERE 1=1"
+        params: list = []
+        if binary_id is not None:
+            sql += " AND binary_id = ?"
+            params.append(binary_id)
+        if session_id is not None:
+            sql += " AND session_id = ?"
+            params.append(session_id)
+        sql += " ORDER BY ts DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        return [dict(r) for r in self.nb.conn.execute(sql, params).fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# aliases
+# ---------------------------------------------------------------------------
+
+class AliasesManager:
+    __slots__ = ("nb",)
+
+    def __init__(self, nb: Notebook):
+        self.nb = nb
+
+    def upsert(
+        self,
+        *,
+        binary_id: int,
+        rva: str,
+        name: str,
+        tags: list[str] | None = None,
+        status: str | None = None,
+        confidence: float | None = None,
+        notes: str | None = None,
+    ) -> None:
+        with self.nb.transaction() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO aliases (binary_id, rva, name, tags, status,
+                   confidence, notes, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                (binary_id, rva, name, _json_serialize(tags) if tags else None, status, confidence, notes),
+            )
+
+    def get(self, binary_id: int, rva: str) -> dict | None:
+        row = self.nb.conn.execute(
+            "SELECT * FROM aliases WHERE binary_id = ? AND rva = ?", (binary_id, rva)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list(self, binary_id: int) -> list[dict]:
+        return [
+            dict(r)
+            for r in self.nb.conn.execute(
+                "SELECT * FROM aliases WHERE binary_id = ? ORDER BY rva", (binary_id,)
+            ).fetchall()
+        ]
+
+
+# ---------------------------------------------------------------------------
+# hypotheses
+# ---------------------------------------------------------------------------
+
+class HypothesesManager:
+    __slots__ = ("nb",)
+
+    def __init__(self, nb: Notebook):
+        self.nb = nb
+
+    def create(
+        self,
+        *,
+        text: str,
+        binary_id: int | None = None,
+        status: str = "open",
+        evidence_for: list | None = None,
+        evidence_against: list | None = None,
+    ) -> int:
+        with self.nb.transaction() as conn:
+            conn.execute(
+                """INSERT INTO hypotheses (binary_id, text, status, evidence_for, evidence_against)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (binary_id, text, status, _json_serialize(evidence_for) if evidence_for else None, _json_serialize(evidence_against) if evidence_against else None),
+            )
+            row = conn.execute("SELECT last_insert_rowid()").fetchone()
+        return int(row[0]) if row else 0
+
+    def update(self, id_: int, **fields) -> None:
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        values = list(fields.values())
+        values.append(id_)
+        with self.nb.transaction() as conn:
+            conn.execute(
+                f"UPDATE hypotheses SET {sets}, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                values,
+            )
+
+    def list(self, *, binary_id: int | None = None, status: str | None = None) -> list[dict]:
+        sql = "SELECT * FROM hypotheses WHERE 1=1"
+        params: list = []
+        if binary_id is not None:
+            sql += " AND binary_id = ?"
+            params.append(binary_id)
+        if status is not None:
+            sql += " AND status = ?"
+            params.append(status)
+        sql += " ORDER BY updated_at DESC"
+        return [dict(r) for r in self.nb.conn.execute(sql, params).fetchall()]
+
+    def get(self, id_: int) -> dict | None:
+        row = self.nb.conn.execute("SELECT * FROM hypotheses WHERE id = ?", (id_,)).fetchone()
+        return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# artifact_views  (F11)
+# ---------------------------------------------------------------------------
+
+class ArtifactViewsManager:
+    __slots__ = ("nb",)
+
+    def __init__(self, nb: Notebook):
+        self.nb = nb
+
+    def upsert(
+        self,
+        *,
+        binary_id: int,
+        rva: str | None,
+        kind: str,
+        source_table: str | None = None,
+        source_row_id: int | None = None,
+        summary: str,
+        key_entities: str,
+        view_model: str = "extractive_v1",
+        analysis_generation: int = 0,
+    ) -> int:
+        with self.nb.transaction() as conn:
+            conn.execute(
+                """INSERT INTO artifact_views (binary_id, rva, kind, source_table,
+                   source_row_id, summary, key_entities, view_model, analysis_generation)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (binary_id, rva, kind, source_table, source_row_id, summary, key_entities, view_model, analysis_generation),
+            )
+            row = conn.execute("SELECT last_insert_rowid()").fetchone()
+        return int(row[0]) if row else 0
+
+    def get_for(self, binary_id: int, rva: str, kind: str) -> dict | None:
+        row = self.nb.conn.execute(
+            "SELECT * FROM artifact_views WHERE binary_id = ? AND rva = ? AND kind = ? ORDER BY analysis_generation DESC LIMIT 1",
+            (binary_id, rva, kind),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def count_for_binary(self, binary_id: int) -> int:
+        row = self.nb.conn.execute(
+            "SELECT COUNT(*) FROM artifact_views WHERE binary_id = ?", (binary_id,)
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+
+# ---------------------------------------------------------------------------
+# embeddings  (F12 meta)
+# ---------------------------------------------------------------------------
+
+class EmbeddingsManager:
+    __slots__ = ("nb",)
+
+    def __init__(self, nb: Notebook):
+        self.nb = nb
+
+    def insert(
+        self,
+        *,
+        binary_id: int,
+        rva: str | None,
+        kind: str,
+        model: str,
+        dim: int,
+        embedder_version: str,
+        src_view_id: int | None = None,
+        analysis_generation: int = 0,
+        vec_blob: bytes | None = None,
+        vec_rowid: int | None = None,
+    ) -> int:
+        with self.nb.transaction() as conn:
+            conn.execute(
+                """INSERT INTO embeddings (binary_id, rva, kind, model, dim,
+                   embedder_version, src_view_id, analysis_generation, vec, vec_rowid)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (binary_id, rva, kind, model, dim, embedder_version, src_view_id, analysis_generation, vec_blob, vec_rowid),
+            )
+            row = conn.execute("SELECT last_insert_rowid()").fetchone()
+        return int(row[0]) if row else 0
+
+    def delete_for_binary(self, binary_id: int) -> int:
+        with self.nb.transaction() as conn:
+            conn.execute("DELETE FROM embeddings WHERE binary_id = ?", (binary_id,))
+            return conn.total_changes
+
+    def count_for_binary(self, binary_id: int) -> int:
+        row = self.nb.conn.execute(
+            "SELECT COUNT(*) FROM embeddings WHERE binary_id = ?", (binary_id,)
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def list_for_binary(self, binary_id: int) -> list[dict]:
+        return [
+            dict(r)
+            for r in self.nb.conn.execute(
+                "SELECT * FROM embeddings WHERE binary_id = ?", (binary_id,)
+            ).fetchall()
+        ]
+
+
+# ---------------------------------------------------------------------------
+# embed_queue  (Phase 2 stub)
+# ---------------------------------------------------------------------------
+
+class EmbedQueueManager:
+    __slots__ = ("nb",)
+
+    def __init__(self, nb: Notebook):
+        self.nb = nb
+
+    def enqueue(self, src_view_id: int) -> int:
+        with self.nb.transaction() as conn:
+            conn.execute(
+                "INSERT INTO embed_queue (src_view_id, status) VALUES (?, 'pending')",
+                (src_view_id,),
+            )
+            row = conn.execute("SELECT last_insert_rowid()").fetchone()
+        return int(row[0]) if row else 0
+
+    def pending(self) -> list[dict]:
+        return [
+            dict(r)
+            for r in self.nb.conn.execute(
+                "SELECT * FROM embed_queue WHERE status = 'pending' ORDER BY created_at"
+            ).fetchall()
+        ]
+
+    def mark_done(self, queue_id: int) -> None:
+        with self.nb.transaction() as conn:
+            conn.execute(
+                "UPDATE embed_queue SET status = 'done', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (queue_id,),
+            )
+
+    def mark_error(self, queue_id: int, error: str) -> None:
+        with self.nb.transaction() as conn:
+            conn.execute(
+                "UPDATE embed_queue SET status = 'error', last_error = ?, attempts = attempts + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (error, queue_id),
+            )
+
+
+# ---------------------------------------------------------------------------
+# FTS search
+# ---------------------------------------------------------------------------
+
+class SearchManager:
+    __slots__ = ("nb",)
+
+    def __init__(self, nb: Notebook):
+        self.nb = nb
+
+    def query(
+        self,
+        fts_query: str,
+        *,
+        binary_id: int | None = None,
+        kind: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> list[dict]:
+        limit = clamp_limit("fts", limit if limit else 20)
+        offset = validate_offset("fts", offset)
+        # Escape FTS5 special characters to avoid syntax errors.
+        safe = self._escape_fts(fts_query)
+        sql = (
+            "SELECT kind, binary_id, rva, name, snippet(fts, 4, '<b>', '</b>', '...', 32) AS snippet, rank "
+            "FROM fts WHERE fts MATCH ?"
+        )
+        params: list = [safe]
+        if binary_id is not None:
+            sql += " AND binary_id = ?"
+            params.append(binary_id)
+        if kind is not None:
+            sql += " AND kind = ?"
+            params.append(kind)
+        sql += " ORDER BY rank LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        return [dict(r) for r in self.nb.conn.execute(sql, params).fetchall()]
+
+    def upsert(
+        self,
+        *,
+        kind: str,
+        binary_id: int,
+        rva: str,
+        name: str | None = None,
+        body: str | None = None,
+    ) -> None:
+        """Insert or replace an FTS row keyed by (kind, binary_id, rva)."""
+        with self.nb.transaction() as conn:
+            # FTS5 doesn't support INSERT OR REPLACE directly over content-sync
+            # tables. We use a delete+insert pair.
+            conn.execute(
+                "DELETE FROM fts WHERE kind = ? AND binary_id = ? AND rva = ?",
+                (kind, binary_id, rva),
+            )
+            conn.execute(
+                "INSERT INTO fts (kind, binary_id, rva, name, body) VALUES (?, ?, ?, ?, ?)",
+                (kind, binary_id, rva, name or "", body or ""),
+            )
+
+    @staticmethod
+    def _escape_fts(query: str) -> str:
+        """Wrap FTS5-special characters in double quotes to avoid syntax errors.
+
+        FTS5 treats ``*``, ``"``, ``(``, ``)``, ``:``, ``?``, and ``~`` specially.
+        A bare query like ``malloc(`` would error. We wrap the whole query in
+        double quotes if any of those characters appear, producing a phrase
+        query that matches the literal token.
+        """
+        special = set("*\"():?~")
+        if any(c in query for c in special):
+            return f'"{query}"'
+        return query
+
+    def index_view(
+        self,
+        *,
+        kind: str,
+        binary_id: int,
+        rva: str | None = None,
+        name: str | None = None,
+        body: str = "",
+    ) -> None:
+        """Shortcut: upsert an FTS row from extracted view data."""
+        self.upsert(
+            kind=kind,
+            binary_id=binary_id,
+            rva=rva or "",
+            name=name,
+            body=body,
+        )
