@@ -44,6 +44,7 @@ from ghidra_nexus.models import (
     CallGraphDirection,
     CallGraphDisplayType,
     CallGraphResult,
+    CodeSearchResult,
     CodeSearchResults,
     CommentResponse,
     CrossReferenceInfos,
@@ -154,27 +155,24 @@ def _require_program(
 
 _NOTEBOOK_SINGLETON: Notebook | None = None
 _NOTEBOOK_LOCK = asyncio.Lock()
+_SESSION_ID = __import__("uuid").uuid4().hex[:12]  # per-daemon session id for breadcrumbs
 
 
-async def _get_notebook() -> Notebook:
-    """Return the per-process notebook singleton.
-
-    Opens lazily at the first call — no Ghidra needed. The notebook path is
-    derived from the current PyGhidraContext's ``nexus_data_dir``.
-    """
+async def _get_notebook(pyghidra_context=None) -> Notebook:
+    """Return the per-process notebook singleton, deriving the path from context."""
     global _NOTEBOOK_SINGLETON
     if _NOTEBOOK_SINGLETON is not None:
         return _NOTEBOOK_SINGLETON
     async with _NOTEBOOK_LOCK:
         if _NOTEBOOK_SINGLETON is not None:
             return _NOTEBOOK_SINGLETON
-        from ghidra_nexus.context import PyGhidraContext
-
-        pyghidra_context = PyGhidraContext.__new__(PyGhidraContext)
-        pyghidra_context.nexus_data_dir = None
-        for attr in ("nexus_data_dir",):
-            pass  # resolved at first handler call
-        _NOTEBOOK_SINGLETON = Notebook.open("ghidra_nexus_projects/my_project-nexus/notebook.sqlite")
+        path = "ghidra_nexus_projects/my_project-nexus/notebook.sqlite"
+        if pyghidra_context is not None:
+            ndd = getattr(pyghidra_context, "nexus_data_dir", None)
+            if ndd:
+                from pathlib import Path as _Path
+                path = str(_Path(ndd) / "notebook.sqlite")
+        _NOTEBOOK_SINGLETON = Notebook.open(path)
         return _NOTEBOOK_SINGLETON
 
 
@@ -264,10 +262,10 @@ def mcp_error_handler(func):
 
     async def _insert_breadcrumb(kwargs):
         try:
-            nb = await _get_notebook()
+            nb = await _get_notebook(pyghidra_context)
             binary_name = kwargs.get("binary_name")
             if binary_name:
-                record_breadcrumb(nb, binary_id=None, session_id="session", tool=tool_name,
+                record_breadcrumb(nb, binary_id=None, session_id=_SESSION_ID, tool=tool_name,
                                   summary=f"{action} on {binary_name}")
         except Exception:
             pass
@@ -335,7 +333,7 @@ async def decompile_function(
     limit = clamp_limit("decompile_lines", limit if limit > 0 else None)
 
     # Notebook setup
-    nb = await _get_notebook()
+    nb = await _get_notebook(pyghidra_context)
     sha256, image_base, _gen = _get_binary_meta(pyghidra_context, binary_name, program_info)
     bid = resolve_binary_id(nb, binary_name, sha256, image_base=image_base)
     current_gen = nb.binaries.get(binary_name) or {}
@@ -439,30 +437,61 @@ async def search_code(
     ctx: Context,
     limit: int = 5,
     offset: int = 0,
-    search_mode: Literal["semantic", "literal"] = "semantic",
+    search_mode: Literal["semantic", "literal", "hybrid"] = "hybrid",
     include_full_code: bool = True,
     preview_length: int = 500,
     similarity_threshold: float = 0.0,
 ) -> CodeSearchResults:
-    _, program_info = _require_program(ctx, binary_name, require_analysis=True)
-    tools = GhidraTools(program_info)
+    """Semantic / lexical search over the notebook knowledge plane.
 
-    def _run():
-        return tools.search_code(
-            query=query,
-            limit=limit,
-            offset=offset,
-            search_mode=SearchMode(search_mode),
-            include_full_code=include_full_code,
-            preview_length=preview_length,
-            similarity_threshold=similarity_threshold,
-        )
+    Backend: notebook/sqlite-vec hybrid (default), FTS-only (fallback).
+    Set env ``NEXUS_SEMANTIC_BACKEND=chromadb`` for the legacy path.
+    """
+    import os as _os
 
-    return await get_executor().submit(
-        program_info,
-        _run,
-        task_id=f"search_code:{binary_name}:{query[:40]}",
-    )
+    if _os.environ.get("NEXUS_SEMANTIC_BACKEND") == "chromadb":
+        _, program_info = _require_program(ctx, binary_name, require_analysis=True)
+        tools = GhidraTools(program_info)
+        def _legacy():
+            return tools.search_code(query=query, limit=limit, offset=offset,
+                search_mode=SearchMode(search_mode if search_mode != "hybrid" else "semantic"),
+                include_full_code=include_full_code, preview_length=preview_length,
+                similarity_threshold=similarity_threshold)
+        return await get_executor().submit(program_info, _legacy, task_id=f"search_code:{binary_name}:{query[:40]}")
+
+    pyghidra_context, _ = _require_program(ctx, binary_name, require_analysis=False)
+    nb = await _get_notebook(pyghidra_context)
+    b = nb.binaries.get(binary_name)
+    bid = b["id"] if b else 0
+    vec_available = nb.vec_available
+
+    query_vec = None
+    if vec_available and search_mode in ("semantic", "hybrid"):
+        from ghidra_nexus.notebook.embedder import get_embedder
+        embedder = get_embedder()
+        query_vec = embedder.encode(query)
+
+    from ghidra_nexus.notebook.search import hybrid_search
+    result = hybrid_search(nb.conn, query, query_vec, binary_id=bid if bid else None,
+        kind=None, limit=limit, offset=offset,
+        vec_available=vec_available and query_vec is not None)
+
+    hits = []
+    for h in result["results"]:
+        preview = h.get("snippet", "")[:preview_length]
+        hits.append(CodeSearchResult(
+            function_name=h.get("name", ""),
+            code=preview if not include_full_code else f"rva:{h.get('rva','')} name:{h.get('name','')}",
+            similarity=float(h.get("score", 0)), search_mode=SearchMode(search_mode if search_mode != "hybrid" else "semantic"),
+            preview=preview))
+
+    return CodeSearchResults(
+        results=hits, query=query,
+        search_mode=SearchMode(search_mode if search_mode != "hybrid" else "semantic"),
+        vec_available=result["vec_available"], vec_index_complete=False, backend=result["backend"],
+        returned_count=result["returned"], offset=offset, limit=limit,
+        total_functions=result["total_fts"] + result["total_vec"],
+        literal_total=result["total_fts"], semantic_total=result["total_vec"])
 
 
 @mcp_error_handler
@@ -702,7 +731,7 @@ async def list_xrefs(
     targets = [name_or_address] if isinstance(name_or_address, str) else name_or_address
     limit = clamp_limit("xrefs", limit if limit > 0 else None)
 
-    nb = await _get_notebook()
+    nb = await _get_notebook(pyghidra_context)
     sha256, image_base, _gen = _get_binary_meta(pyghidra_context, binary_name, program_info)
     bid = resolve_binary_id(nb, binary_name, sha256, image_base=image_base)
 
@@ -751,7 +780,7 @@ async def search_strings(
 ) -> StringSearchResults:
     limit = clamp_limit("strings", limit)
     pyghidra_context, program_info = _require_program(ctx, binary_name, require_analysis=False)
-    nb = await _get_notebook()
+    nb = await _get_notebook(pyghidra_context)
     sha256, image_base, _gen = _get_binary_meta(pyghidra_context, binary_name, program_info)
     bid = resolve_binary_id(nb, binary_name, sha256, image_base=image_base)
 
@@ -806,7 +835,7 @@ async def disassemble(
     limit = clamp_limit("disasm_insns", limit if limit > 0 else count)
 
     pyghidra_context, program_info = _require_program(ctx, binary_name, require_analysis=False)
-    nb = await _get_notebook()
+    nb = await _get_notebook(pyghidra_context)
     sha256, image_base, _gen = _get_binary_meta(pyghidra_context, binary_name, program_info)
     bid = resolve_binary_id(nb, binary_name, sha256, image_base=image_base)
     rva = _resolve_rva(address, program_info)
@@ -890,12 +919,15 @@ async def analysis_status(ctx: Context) -> AnalysisStatusResult:
 
     pyghidra_context = _get_context(ctx)
     raw_infos = pyghidra_context.list_project_binary_infos()
+    nb = await _get_notebook(pyghidra_context)
 
     project_path_str = str(getattr(pyghidra_context, "project_path", None) or "") or None
     nexus_dir_str = str(getattr(pyghidra_context, "nexus_data_dir", None) or "") or None
 
     binaries: list[ProgramInfo] = []
     for raw in raw_infos:
+        # Notebook binary data for vec fields
+        vec_data = nb.binaries.get(raw.name) if nb else {}
         # Prefer fields already enriched by list_project_binary_infos.
         function_count = int(getattr(raw, "function_count", 0) or 0)
         sha256 = getattr(raw, "sha256", None)
@@ -978,6 +1010,11 @@ async def analysis_status(ctx: Context) -> AnalysisStatusResult:
                 idb_path=file_path,
                 path_exists=path_exists,
                 recommended_tools=recommended,
+                vec_available=nb.vec_available if nb else False,
+                vec_index_complete=bool(vec_data.get("vec_index_complete", 0)) if vec_data else False,
+                embed_progress=vec_data.get("embed_progress", 0) if vec_data else 0,
+                embed_target=vec_data.get("embed_target", 0) if vec_data else 0,
+                embed_model=vec_data.get("embed_model") if vec_data else None,
             )
         )
 
@@ -1134,7 +1171,7 @@ async def survey_binary_full(
 async def section_health(binary_name: str, ctx: Context) -> list[SectionHealth]:
     """Per-section entropy + classification + agent recommendation."""
     pyghidra_context, program_info = _require_program(ctx, binary_name, require_analysis=False)
-    nb = await _get_notebook()
+    nb = await _get_notebook(pyghidra_context)
     sha256, image_base, _gen = _get_binary_meta(pyghidra_context, binary_name, program_info)
     bid = resolve_binary_id(nb, binary_name, sha256, image_base=image_base)
 
@@ -1175,6 +1212,95 @@ async def import_binary(binary_path: str, ctx: Context) -> ImportRequestResult:
     return pyghidra_context.import_binary_backgrounded(binary_path)
 
 
+# ---- notebook_* tools (Phase 3) ----
+
+
+@mcp_error_handler
+async def notebook_summary(binary_name: str | None, ctx: Context) -> dict:
+    """Per-binary aggregate stats from the notebook cache."""
+    nb = await _get_notebook()
+    if binary_name:
+        b = nb.binaries.get(binary_name)
+        if not b:
+            raise _ToolRecoverable(ToolErrorCode.BINARY_NOT_FOUND, f"Binary {binary_name!r} not in notebook", binary_name=binary_name)
+        return {
+            "binary_name": b["name"], "sha256": b["sha256"], "binary_class": b["binary_class"],
+            "function_count": b["function_count"], "analysis_ready": bool(b["analysis_ready"]),
+            "cached_decompiles": nb.decompiles.count_for_binary(b["id"]),
+            "cached_disassemblies": nb.disassemblies.count_for_binary(b["id"]),
+            "artifact_views": nb.views.count_for_binary(b["id"]),
+            "aliases": len(nb.aliases.list(b["id"])),
+            "breadcrumbs_24h": len(nb.breadcrumbs.recent(limit=9999)),
+            "vec_available": nb.vec_available,
+            "vec_index_complete": bool(b.get("vec_index_complete", 0)),
+            "embed_progress": b.get("embed_progress", 0),
+            "embed_target": b.get("embed_target", 0),
+            "reliability_notes": b.get("reliability_notes"),
+        }
+    all_bins = nb.binaries.all()
+    return {"binaries": [{"name": b["name"], "class": b["binary_class"], "function_count": b["function_count"]} for b in all_bins]}
+
+
+@mcp_error_handler
+async def notebook_search(binary_name: str, query: str, ctx: Context, kind: str = "any", limit: int = 20, offset: int = 0) -> dict:
+    """FTS5 search over notebook views (summary + entities + function names)."""
+    nb = await _get_notebook()
+    b = nb.binaries.get(binary_name)
+    bid = b["id"] if b else 0
+    hits = nb.search.query(query, binary_id=bid if bid else None, kind=None if kind == "any" else kind, limit=limit, offset=offset)
+    return {"hits": hits, "query": query, "kind": kind, "returned": len(hits), "limit": limit, "offset": offset}
+
+
+@mcp_error_handler
+async def notebook_breadcrumbs(binary_name: str | None, ctx: Context, session_id: str | None = None, limit: int = 50) -> list[dict]:
+    """Recent tool-call breadcrumbs from the notebook audit trail."""
+    nb = await _get_notebook()
+    bid = None
+    if binary_name:
+        b = nb.binaries.get(binary_name)
+        if b:
+            bid = b["id"]
+    sid = session_id or _SESSION_ID
+    return nb.breadcrumbs.recent(binary_id=bid, session_id=sid, limit=limit)
+
+
+@mcp_error_handler
+async def notebook_alias(binary_name: str, addr: str, ctx: Context, name: str | None = None, tags: list[str] | None = None, status: str | None = None, notes: str | None = None) -> dict:
+    """Set or get an address alias."""
+    nb = await _get_notebook()
+    b = nb.binaries.get(binary_name)
+    if not b:
+        raise _ToolRecoverable(ToolErrorCode.BINARY_NOT_FOUND, f"Binary {binary_name!r} not found", binary_name=binary_name)
+    if name is None and tags is None:
+        a = nb.aliases.get(b["id"], addr)
+        return a if a else {"addr": addr, "name": None, "tags": [], "status": "unknown"}
+    nb.aliases.upsert(binary_id=b["id"], rva=addr, name=name or "", tags=tags, status=status, notes=notes)
+    a = nb.aliases.get(b["id"], addr)
+    return a if a else {}
+
+
+@mcp_error_handler
+async def notebook_hypothesis(action: str, ctx: Context, id: int | None = None, binary_name: str | None = None, text: str | None = None, status: str | None = None) -> dict:
+    """Hypothesis board CRUD (create, update, list, get)."""
+    nb = await _get_notebook()
+    bid = None
+    if binary_name:
+        b = nb.binaries.get(binary_name)
+        if b:
+            bid = b["id"]
+    if action == "create":
+        hid = nb.hypotheses.create(text=text or "", binary_id=bid, status=status or "open")
+        return nb.hypotheses.get(hid) or {"id": hid}
+    elif action == "update" and id is not None:
+        nb.hypotheses.update(id, status=status or "open", **(({"text": text} if text else {})))
+        return nb.hypotheses.get(id) or {}
+    elif action == "list":
+        return {"hypotheses": nb.hypotheses.list(binary_id=bid, status=status)}
+    elif action == "get" and id is not None:
+        return nb.hypotheses.get(id) or {}
+    raise _ToolRecoverable(ToolErrorCode.INVALID_PARAMS, f"Unknown action {action!r} or missing id")
+
+
 @mcp_error_handler
 async def save(ctx: Context) -> SaveRequestResult:
     pyghidra_context = _get_context(ctx)
@@ -1213,6 +1339,11 @@ def _register_all_on_demand(mcp_server):
         (analysis_status, "analysis_status"),
         (import_binary, "import_binary"),
         (save, "save"),
+        (notebook_summary, "notebook_summary"),
+        (notebook_search, "notebook_search"),
+        (notebook_breadcrumbs, "notebook_breadcrumbs"),
+        (notebook_alias, "notebook_alias"),
+        (notebook_hypothesis, "notebook_hypothesis"),
     ]
     for fn, name in tools:
         try:

@@ -128,6 +128,12 @@ def register_common_tools(server: FastMCP) -> None:
     server.tool()(mcp_tools.survey_binary)
     server.tool()(mcp_tools.survey_binary_fast)
     server.tool()(mcp_tools.survey_binary_full)
+    # Phase 3 notebook tools
+    server.tool()(mcp_tools.notebook_summary)
+    server.tool()(mcp_tools.notebook_search)
+    server.tool()(mcp_tools.notebook_breadcrumbs)
+    server.tool()(mcp_tools.notebook_alias)
+    server.tool()(mcp_tools.notebook_hypothesis)
 
 
 def register_gui_tools(server: FastMCP) -> None:

@@ -23,26 +23,39 @@ class IndexingMixin:
     programs: dict[str, Any]
 
     def _init_indexing_state(self, nexus_data_dir: Path, *, threaded: bool) -> None:
+        """Initialize ChromaDB ONLY when NEXUS_SEMANTIC_BACKEND=chromadb.
+
+        Phase 3 demotion: by default, ChromaDB is NOT started. The notebook's
+        sqlite-vec path serves all semantic queries. Set the env var to restore
+        the legacy ChromaDB backend.
+        """
+        import os as _os
+
+        use_chromadb = _os.environ.get("NEXUS_SEMANTIC_BACKEND") == "chromadb"
         chromadb_path = nexus_data_dir / "chromadb"
-        chromadb_path.mkdir(parents=True, exist_ok=True)
-        try:
-            self.chroma_client = chromadb.PersistentClient(
-                path=str(chromadb_path), settings=Settings(anonymized_telemetry=False)
-            )
-        except Exception as e:
-            logger.critical(
-                "Failed to initialize ChromaDB at %s: %s. "
-                "Creating a fresh ChromaDB directory.",
-                chromadb_path, e,
-            )
-            import shutil
-            shutil.rmtree(str(chromadb_path), ignore_errors=True)
+        if use_chromadb:
             chromadb_path.mkdir(parents=True, exist_ok=True)
-            self.chroma_client = chromadb.PersistentClient(
-                path=str(chromadb_path), settings=Settings(anonymized_telemetry=False)
-            )
-            logger.info("ChromaDB re-initialized at %s", chromadb_path)
-        self.chroma_client.heartbeat()
+            try:
+                self.chroma_client = chromadb.PersistentClient(
+                    path=str(chromadb_path), settings=Settings(anonymized_telemetry=False)
+                )
+            except Exception as e:
+                logger.critical(
+                    "Failed to initialize ChromaDB at %s: %s. "
+                    "Creating a fresh ChromaDB directory.",
+                    chromadb_path, e,
+                )
+                import shutil
+                shutil.rmtree(str(chromadb_path), ignore_errors=True)
+                chromadb_path.mkdir(parents=True, exist_ok=True)
+                self.chroma_client = chromadb.PersistentClient(
+                    path=str(chromadb_path), settings=Settings(anonymized_telemetry=False)
+                )
+                logger.info("ChromaDB re-initialized at %s", chromadb_path)
+            self.chroma_client.heartbeat()
+        else:
+            self.chroma_client = None
+            logger.info("ChromaDB disabled (default); sqlite-vec is the semantic backend")
         self.index_executor = (
             concurrent.futures.ThreadPoolExecutor(max_workers=1) if threaded else None
         )

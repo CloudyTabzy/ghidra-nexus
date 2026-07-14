@@ -106,6 +106,13 @@ class ProgramInfo(BaseModel):
         ),
     )
 
+    # Phase 3 vec readiness fields
+    vec_available: bool = False
+    vec_index_complete: bool = False
+    embed_progress: int = 0
+    embed_target: int = 0
+    embed_model: str | None = None
+
 
 class AnalysisStatusResult(BaseModel):
     """Top-level ``analysis_status`` response.
@@ -402,6 +409,11 @@ class CodeSearchResults(BaseModel):
     literal_total: int = Field(..., description="total literal matches")
     semantic_total: int = Field(..., description="estimated semantic matches")
     total_functions: int
+
+    # Phase 3 vec fields (optional, backward-compat)
+    vec_available: bool = Field(False, description="True when sqlite-vec is loaded.")
+    vec_index_complete: bool = Field(False, description="True when all views for this binary are embedded.")
+    backend: str = Field("unknown", description="Which search backend served this query: sqlite_vec, fts_only, chromadb, hybrid.")
 
 
 class StringInfo(BaseModel):
