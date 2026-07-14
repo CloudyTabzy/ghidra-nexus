@@ -12,6 +12,7 @@ dependencies = [
     "ghidrecomp>=0.5.8",
     "sqlite-vec>=0.1.0",
     "sentence-transformers>=4.1.0",
+    "optimum[onnxruntime]==2.1.0",
 ]
 authors = [
     { name = "CloudyTabzy" },

@@ -6,6 +6,7 @@ notebook_explain_callgraph) are gated on the ``NEXUS_SLM_MODEL`` env var.
 """
 from ghidra_nexus.slm.loader import (
     SLMConfig,
+    backend,
     get_model,
     is_available,
     model_status,
@@ -26,6 +27,7 @@ from ghidra_nexus.slm.tasks import (
 __all__ = [
     # Configuration / loader
     "SLMConfig",
+    "backend",
     "get_model",
     "is_available",
     "model_status",

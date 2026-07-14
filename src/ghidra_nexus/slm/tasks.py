@@ -147,52 +147,78 @@ def _invoke_slm(
 
 
 def _extract_json(text: str) -> dict | list | None:
-    """Extract the first balanced JSON object or array from a model response.
+    """Extract the outermost balanced JSON object or array from a model response.
 
     Models sometimes wrap output in markdown fences (``\\`\\`\\`json ... \\`\\`\\`\\``)
-    or add leading prose ("Here's the answer: { ... }"). This helper pulls the
-    first balanced ``{...}`` or ``[...]`` block and parses it.
+    or add leading prose ("Here's the answer: { ... }").
+
+    Strategy:
+      1. Find the FIRST opening brace/bracket after stripping fences.
+      2. Match its closing counterpart (handles nested structures and
+         strings with escaped quotes).
+      3. Try to parse that span.
+      4. If parse fails, return None — do NOT silently fall through to an
+         inner span, which would mislead the caller (e.g. extracting just
+         ``["raw", "query"]`` from a malformed outer object).
+
+    If the first opening brace is a ``[`` (e.g. the model returned a bare
+    array), that's fine; we just match the ``]``.
     """
-    # Strip markdown fences
     text = re.sub(r"^```(?:json)?\s*", "", text.strip())
     text = re.sub(r"```\s*$", "", text)
 
-    # Find the first { or [ and the matching closing brace
+    # Find the FIRST opening brace or bracket.
+    first_open_idx = -1
+    first_open_ch = ""
+    first_close_ch = ""
     for i, ch in enumerate(text):
-        if ch not in "{[":
+        if ch in "{[":
+            first_open_idx = i
+            first_open_ch = ch
+            first_close_ch = "}" if ch == "{" else "]"
+            break
+
+    if first_open_idx == -1:
+        # No JSON-like structure at all
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return None
+
+    # Walk forward from the first opener, tracking depth + string state.
+    depth = 0
+    in_str = False
+    escape = False
+    for j in range(first_open_idx, len(text)):
+        c = text[j]
+        if escape:
+            escape = False
             continue
-        open_ch, close_ch = ch, "}" if ch == "{" else "]"
-        depth = 0
-        in_str = False
-        escape = False
-        for j in range(i, len(text)):
-            c = text[j]
-            if escape:
-                escape = False
-                continue
-            if c == "\\":
-                escape = True
-                continue
-            if c == '"':
-                in_str = not in_str
-                continue
-            if in_str:
-                continue
-            if c == open_ch:
-                depth += 1
-            elif c == close_ch:
-                depth -= 1
-                if depth == 0:
-                    candidate = text[i:j + 1]
-                    try:
-                        return json.loads(candidate)
-                    except json.JSONDecodeError:
-                        break
-    # Fallback: try the whole text
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return None
+        if c == "\\":
+            escape = True
+            continue
+        if c == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if c == first_open_ch:
+            depth += 1
+        elif c == first_close_ch:
+            depth -= 1
+            if depth == 0:
+                candidate = text[first_open_idx:j + 1]
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    # Outer span failed to parse. Do NOT fall through to
+                    # an inner span — return None so the caller falls back
+                    # to a heuristic rather than receiving a misleading
+                    # fragment.
+                    return None
+
+    # Unmatched brace — give up gracefully.
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +266,10 @@ def run_query_expand(
     )
     parsed = _extract_json(raw_text)
     if not isinstance(parsed, dict):
+        logger.debug(
+            "run_query_expand: SLM output failed to parse; heuristic fallback. Raw: %r",
+            raw_text[:300],
+        )
         return _fallback_expand(query, "<parse-failed>", 0)
 
     raw_tokens = parsed.get("tokens") or []

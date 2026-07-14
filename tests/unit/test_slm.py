@@ -458,3 +458,91 @@ class TestRunQueryExpandWithMockedSLM:
             binary_name="x", query="y", max_tokens=10
         )
         assert len(result.tokens) == 10
+
+
+
+# ===========================================================================
+# Loader backend detection
+# ===========================================================================
+
+
+class TestBackendDetection:
+    """Tests for the ONNX/PyTorch backend auto-selection."""
+
+    def test_onnx_community_uses_onnx_backend(self, monkeypatch):
+        """onnx-community/* selects ONNX backend (when optimum is available)."""
+        from ghidra_nexus.slm import backend as _backend
+        from ghidra_nexus.slm.loader import _HAS_OPTIMUM
+
+        monkeypatch.setenv(
+            "NEXUS_SLM_MODEL", "onnx-community/Qwen2.5-Coder-1.5B-Instruct"
+        )
+        if _HAS_OPTIMUM:
+            assert _backend() == "onnx"
+        else:
+            assert _backend() in ("onnx", "unavailable")
+
+    def test_unconfigured_returns_unavailable(self, monkeypatch):
+        """No env var = unavailable regardless of installed libs."""
+        from ghidra_nexus.slm import backend as _backend
+
+        monkeypatch.delenv("NEXUS_SLM_MODEL", raising=False)
+        assert _backend() == "unavailable"
+
+    def test_model_status_reports_backend(self, monkeypatch):
+        """model_status() returns the auto-detected backend field."""
+        from ghidra_nexus.slm import model_status
+
+        monkeypatch.setenv(
+            "NEXUS_SLM_MODEL", "onnx-community/Qwen2.5-Coder-1.5B-Instruct"
+        )
+        s = model_status()
+        assert s["configured"] is True
+        assert s["backend"] in ("onnx", "unavailable")
+        assert s["model_id"] == "onnx-community/Qwen2.5-Coder-1.5B-Instruct"
+
+    def test_model_status_includes_optimum_flag(self, monkeypatch):
+        from ghidra_nexus.slm import model_status
+
+        monkeypatch.delenv("NEXUS_SLM_MODEL", raising=False)
+        s = model_status()
+        assert "has_optimum" in s
+        assert "has_onnxruntime" in s
+        assert "has_transformers" in s
+        assert "has_torch" in s
+
+
+class TestExtractJsonLongestFirst:
+    """Verify _extract_json prefers the outermost span."""
+
+    def test_outer_object_over_inner_array(self):
+        from ghidra_nexus.slm.tasks import _extract_json
+
+        text = (
+            "```json\n"
+            "{\n"
+            "  \"tokens\": [\"raw\", \"query\"],\n"
+            "  \"fts_query\": '\"a\" \"b\"',\n"
+            "  \"rationale\": \"x\"\n"
+            "}\n"
+            "```"
+        )
+        result = _extract_json(text)
+        if result is not None:
+            # If something parsed, it must NOT be just the inner array
+            assert not (isinstance(result, list) and len(result) == 2)
+            assert isinstance(result, dict)
+
+    def test_valid_outer_object_returns_dict(self):
+        from ghidra_nexus.slm.tasks import _extract_json
+
+        text = "```json\n{\"tokens\": [\"a\"], \"fts_query\": \"x\"}\n```"
+        result = _extract_json(text)
+        assert isinstance(result, dict)
+        assert result["tokens"] == ["a"]
+
+    def test_plain_object(self):
+        from ghidra_nexus.slm.tasks import _extract_json
+
+        assert _extract_json('{"a": 1}') == {"a": 1}
+        assert _extract_json("[1, 2, 3]") == [1, 2, 3]
