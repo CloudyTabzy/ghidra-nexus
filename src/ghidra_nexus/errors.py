@@ -90,6 +90,10 @@ class ToolErrorCode(str, Enum):
     SEMANTIC_BACKEND_UNAVAILABLE = "semantic_backend_unavailable"
     NOTEBOOK_NOT_READY = "notebook_not_ready"
 
+    # SLM (Phase 6)
+    SLM_DISABLED = "slm_disabled"
+    SLM_FAILED = "slm_failed"
+
     # ----- Catch-all -----
     UNKNOWN = "unknown_error"
 
@@ -139,6 +143,7 @@ REGISTERED_TOOL_NAMES: frozenset[str] = frozenset(
         "notebook_rebuild_embeddings",
         "notebook_archive_breadcrumbs",
         "notebook_vacuum",
+        "notebook_query_expand",
     }
 )
 
@@ -176,6 +181,8 @@ _FALLBACK_TOOL: dict[ToolErrorCode, str] = {
     # Notebook
     ToolErrorCode.SEMANTIC_BACKEND_UNAVAILABLE: "notebook_embed_status",
     ToolErrorCode.NOTEBOOK_NOT_READY: "notebook_summary",
+    ToolErrorCode.SLM_DISABLED: "search_code",
+    ToolErrorCode.SLM_FAILED: "search_code",
 }
 
 

@@ -695,8 +695,52 @@ async def search_code(
         embedder = get_embedder()
         query_vec = embedder.encode(query)
 
+    # Phase 6.1: SLM query expansion. Opt-in via NEXUS_SLM_MODEL. The SLM
+    # reformulates the natural-language query into FTS-friendly tokens +
+    # related API names; we then run the FTS path with the expanded query
+    # and the embedder path with the original query (so semantic recall is
+    # preserved). Any failure / disabled state falls back to the raw query.
+    fts_query_for_search = query
+    if query and _os.environ.get("NEXUS_SLM_MODEL"):
+        try:
+            from ghidra_nexus.slm import is_available as _slm_available
+            if _slm_available():
+                from ghidra_nexus.slm import run_query_expand as _slm_qe
+                # Build alias + api context (bounded, async-safe)
+                _alias_names: list[str] = []
+                for r in nb.conn.execute(
+                    "SELECT name FROM aliases WHERE binary_id = ? AND name IS NOT NULL",
+                    (bid,),
+                ).fetchall():
+                    if r[0]:
+                        _alias_names.append(r[0])
+                _known_apis: list[str] = []
+                for r in nb.conn.execute(
+                    "SELECT DISTINCT value FROM artifact_views, json_each(key_entities) "
+                    "WHERE artifact_views.binary_id = ? "
+                    "AND json_extract(value, '$.kind') = 'api' LIMIT 30",
+                    (bid,),
+                ).fetchall():
+                    if r[0]:
+                        _known_apis.append(r[0])
+                _expanded = await asyncio.to_thread(
+                    _slm_qe,
+                    binary_name=binary_name,
+                    query=query,
+                    known_aliases=_alias_names,
+                    known_apis=_known_apis,
+                )
+                if _expanded.fts_query:
+                    fts_query_for_search = _expanded.fts_query
+        except Exception as e:
+            logger.debug("SLM query_expand failed; using raw query: %s", e)
+
     from ghidra_nexus.notebook.search import hybrid_search
-    result = hybrid_search(nb.conn, query, query_vec, binary_id=bid if bid else None,
+    # We pass `query` (raw) to search_fts internally for the snippet match
+    # and the expanded fts_query for the ranking signal. hybrid_search takes
+    # the user-supplied query for snippet; the FTS MATCH is built from
+    # the fts_query. See hybrid_search for the exact contract.
+    result = hybrid_search(nb.conn, fts_query_for_search, query_vec, binary_id=bid if bid else None,
         kind=None, limit=limit, offset=offset,
         vec_available=vec_available and query_vec is not None)
 
@@ -1773,6 +1817,102 @@ async def notebook_embed_status(ctx: Context, binary_name: str | None = None) ->
 
 
 @mcp_error_handler
+async def notebook_query_expand(
+    ctx: Context,
+    binary_name: str,
+    query: str,
+) -> dict:
+    """Reformulate a natural-language search query into FTS-friendly tokens.
+
+    **Phase 6.1 (SLM tools).** Opt-in via ``NEXUS_SLM_MODEL`` env var. When
+    the SLM is not configured, returns ``slm_disabled`` with a fallback
+    to ``search_code`` (raw query). When configured, the SLM produces
+    grounded tokens + related API names + a reformulated ``fts_query`` that
+    is fed into the existing ``search_code`` FTS path.
+
+    Grounded output: every token is a valid lowercase identifier; every
+    API name is checked against a built-in catalog (~150 common Windows /
+    POSIX APIs); the fts_query has balanced quotes and an alphanumeric
+    token. Grounding failures fall back to a heuristic expansion
+    (whitespace-split lowercase).
+
+    Env vars: ``NEXUS_SLM_MODEL`` (e.g. ``Qwen/Qwen2.5-Coder-1.5B-Instruct``),
+    ``NEXUS_SLM_DEVICE`` (cpu/cuda/mps), ``NEXUS_SLM_TIMEOUT_SEC`` (default 30).
+    """
+    from ghidra_nexus.slm import is_available as _slm_available
+    from ghidra_nexus.slm import run_query_expand as _slm_run_query_expand
+
+    if not _slm_available():
+        return {
+            "ok": False,
+            "error_code": "slm_disabled",
+            "message": (
+                "NEXUS_SLM_MODEL is not set. Pass NEXUS_SLM_MODEL=<hf_id> to "
+                "enable SLM-backed query expansion. The raw query is still "
+                "usable via search_code (search_mode='hybrid')."
+            ),
+            "fallback_tool": "search_code",
+        }
+
+    nb = await _get_notebook()
+    b = nb.binaries.get(binary_name)
+    if not b:
+        raise _ToolRecoverable(
+            ToolErrorCode.BINARY_NOT_FOUND,
+            f"Binary {binary_name!r} not in notebook",
+            binary_name=binary_name,
+        )
+    bid = b["id"]
+
+    # Pull existing alias names and API references from the notebook to
+    # give the SLM context. Bounded to keep the prompt short.
+    alias_names: list[str] = []
+    for row in nb.conn.execute(
+        "SELECT name FROM aliases WHERE binary_id = ? AND name IS NOT NULL",
+        (bid,),
+    ).fetchall():
+        if row[0]:
+            alias_names.append(row[0])
+    known_apis: list[str] = []
+    for row in nb.conn.execute(
+        "SELECT DISTINCT value FROM artifact_views, json_each(key_entities) "
+        "WHERE artifact_views.binary_id = ? "
+        "AND json_extract(value, '$.kind') = 'api' LIMIT 30",
+        (bid,),
+    ).fetchall():
+        if row[0]:
+            known_apis.append(row[0])
+
+    try:
+        result = await asyncio.to_thread(
+            _slm_run_query_expand,
+            binary_name=binary_name,
+            query=query,
+            known_aliases=alias_names,
+            known_apis=known_apis,
+        )
+    except Exception as e:
+        logger.debug("SLM query_expand failed: %s", e, exc_info=True)
+        return {
+            "ok": False,
+            "error_code": "slm_failed",
+            "message": f"SLM query expansion failed; falling back to search_code. ({e})",
+            "fallback_tool": "search_code",
+        }
+
+    return {
+        "ok": True,
+        "raw_query": result.raw_query,
+        "tokens": result.tokens,
+        "related_apis": result.related_apis,
+        "fts_query": result.fts_query,
+        "rationale": result.rationale,
+        "model": result.model,
+        "latency_ms": result.latency_ms,
+    }
+
+
+@mcp_error_handler
 async def notebook_rebuild_embeddings(
     ctx: Context,
     binary_name: str | None = None,
@@ -1982,6 +2122,7 @@ def _register_all_on_demand(mcp_server):
         (notebook_rebuild_embeddings, "notebook_rebuild_embeddings"),
         (notebook_archive_breadcrumbs, "notebook_archive_breadcrumbs"),
         (notebook_vacuum, "notebook_vacuum"),
+        (notebook_query_expand, "notebook_query_expand"),
     ]
     for fn, name in tools:
         try:
