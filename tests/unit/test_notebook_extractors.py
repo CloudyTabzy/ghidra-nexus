@@ -16,18 +16,34 @@ from ghidra_nexus.notebook.extractors import (
 from ghidra_nexus.notebook.extractors.decompile import DecompileExtractor
 
 
-@pytest.fixture(autouse=True)
-def _clean_registry():
-    """Each test starts with only the default registrations."""
-    reset_for_testing()
-    # Re-register default extractors.
-    from ghidra_nexus.notebook.extractors.decompile import DecompileExtractor
+# Registry tests that mutate state use their own reset+cleanup.
+# Other tests (DecompileExtractor behavior) just depend on the session-level
+# conftest.py fixture which guarantees all families are registered.
+# We DON'T use a global auto-use reset fixture — that poisons cross-module.
 
+
+@pytest.fixture
+def _isolated_registry():
+    """Per-test isolation only for TestRegistry. Restores all families after."""
+    reset_for_testing()
     register(DecompileExtractor())
     yield
+    # Restore all known families so downstream tests (cache, etc.) aren't affected.
     reset_for_testing()
+    register(DecompileExtractor())
+    from ghidra_nexus.notebook.extractors.families import (
+        DisasmExtractor,
+        SectionHealthExtractor,
+        StringsExtractor,
+        XrefsExtractor,
+    )
+    register(DisasmExtractor())
+    register(XrefsExtractor())
+    register(StringsExtractor())
+    register(SectionHealthExtractor())
 
 
+@pytest.mark.usefixtures("_isolated_registry")
 class TestRegistry:
     def test_decompile_registered_by_default(self):
         assert "decompile" in kinds()

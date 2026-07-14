@@ -11,15 +11,26 @@ from .base import (
     reset_for_testing,
 )
 from .decompile import DecompileExtractor
+from .families import (
+    DisasmExtractor,
+    SectionHealthExtractor,
+    StringsExtractor,
+    XrefsExtractor,
+)
 
 __all__ = [
     "DecompileExtractor",
+    "DisasmExtractor",
     "ExtractedView",
     "Extractor",
     "KeyEntity",
+    "SectionHealthExtractor",
+    "StringsExtractor",
+    "XrefsExtractor",
     "extract_for",
     "get",
     "kinds",
     "register",
     "reset_for_testing",
 ]
+

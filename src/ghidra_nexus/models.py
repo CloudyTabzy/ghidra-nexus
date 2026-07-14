@@ -15,8 +15,6 @@ class DecompiledFunction(BaseModel):
             "decompiler_error (Ghidra decompiler failed)"
         ),
     )
-    # New (Phase 0.5): explicit failure classification. Stable string the
-    # agent branches on; one of ToolErrorCode.* values or None on success.
     error_code: str | None = Field(
         None,
         description=(
@@ -33,6 +31,16 @@ class DecompiledFunction(BaseModel):
     callees: list[str] | None = None
     referenced_strings: list[str] | None = None
     xrefs: list["CrossReferenceInfo"] | None = None
+
+    # Phase 2 cache fields
+    cached: bool = Field(
+        False,
+        description="True when the result came from the notebook cache (no JVM call).",
+    )
+    page: dict | None = Field(
+        None,
+        description="Pagination envelope (offset, limit, total, has_more, next_offset).",
+    )
 
 
 class ProgramBasicInfo(BaseModel):
@@ -343,6 +351,7 @@ class CrossReferenceInfos(BaseModel):
     target: str | None = None
     cross_references: list[CrossReferenceInfo]
     error: str | None = None
+    cached: bool = Field(False, description="True when served from the notebook cache.")
     # Phase 0.5.1: typed failure fields (parallel to DecompiledFunction).
     error_code: str | None = None
     hint: str | None = None
@@ -415,6 +424,7 @@ class StringSearchResults(BaseModel):
         None,
         description="Present when some string values could not be read (corrupted data)",
     )
+    cached: bool = Field(False, description="True when served from the notebook cache.")
 
 
 class BytesReadResult(BaseModel):
@@ -433,6 +443,7 @@ class DisassembleResult(BaseModel):
             "address, optional raw bytes (hex, when include_bytes=True), mnemonic, operands."
         ),
     )
+    cached: bool = Field(False, description="True when served from the notebook cache.")
 
 
 class CallGraphDirection(str, Enum):
