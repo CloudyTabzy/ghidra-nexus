@@ -119,12 +119,27 @@ class BinariesManager:
             ).fetchone()
         return row[0] if row else 0
 
-    def mark_analysis_ready(self, binary_name: str) -> None:
+    def mark_analysis_ready(
+        self, binary_name: str, *, function_count: int | None = None
+    ) -> None:
         with self.nb.transaction() as conn:
-            conn.execute(
-                "UPDATE binaries SET analysis_ready = 1, last_analyzed_at = CURRENT_TIMESTAMP WHERE name = ?",
-                (binary_name,),
-            )
+            if function_count is not None:
+                conn.execute(
+                    """UPDATE binaries SET
+                       analysis_ready = 1,
+                       function_count = ?,
+                       last_analyzed_at = CURRENT_TIMESTAMP
+                       WHERE name = ?""",
+                    (function_count, binary_name),
+                )
+            else:
+                conn.execute(
+                    """UPDATE binaries SET
+                       analysis_ready = 1,
+                       last_analyzed_at = CURRENT_TIMESTAMP
+                       WHERE name = ?""",
+                    (binary_name,),
+                )
 
     def set_vec_status(
         self,

@@ -12,6 +12,7 @@ from ghidra_nexus.decompiler_pool import DecompilerPool
 from ghidra_nexus.import_detection import is_ghidra_importable
 from ghidra_nexus.import_planning import ImportCandidate, build_import_plan
 from ghidra_nexus.indexing_mixin import IndexingMixin
+from ghidra_nexus.notebook import Notebook
 from ghidra_nexus.models import (
     ImportRequestResult,
     ProgramInfo as ProgramInfoModel,
@@ -147,7 +148,45 @@ class PyGhidraContext(IndexingMixin):
         self.wait_for_analysis = wait_for_analysis
 
         self.programs: dict[str, ProgramInfo] = {}
+        self._notebook: Notebook | None = None
         self._init_project_programs()
+
+    def _get_notebook(self) -> Notebook | None:
+        """Lazily open the project's notebook SQLite database."""
+        if self._notebook is not None:
+            return self._notebook
+        try:
+            self._notebook = Notebook.open(self.nexus_data_dir / "notebook.sqlite")
+        except Exception:
+            logger.debug("Failed to open notebook at %s", self.nexus_data_dir, exc_info=True)
+        return self._notebook
+
+    def _sync_binary_to_notebook(self, binary_name: str, program_info: ProgramInfo) -> None:
+        """Persist live function count and analysis readiness to the notebook."""
+        nb = self._get_notebook()
+        if nb is None:
+            return
+        try:
+            function_count = self._safe_function_count(program_info)
+            sha256 = self._safe_sha256(program_info) or ""
+            size_bytes = None
+            metadata = program_info.metadata or {}
+            try:
+                size_bytes = int(metadata.get("Size") or 0) or None
+            except Exception:
+                size_bytes = None
+            nb.binaries.upsert(
+                name=binary_name,
+                sha256=sha256,
+                image_base=str(metadata.get("Image Base", "") or ""),
+                arch=str(metadata.get("Architecture", "") or ""),
+                size_bytes=size_bytes,
+                function_count=function_count,
+            )
+            if program_info.analysis_complete:
+                nb.binaries.mark_analysis_ready(binary_name, function_count=function_count)
+        except Exception:
+            logger.debug("Failed to sync binary %s to notebook", binary_name, exc_info=True)
 
     def close(self, save: bool = True, shutdown_timeout: float = 10.0):
         """
@@ -1031,6 +1070,7 @@ class PyGhidraContext(IndexingMixin):
             info = self.programs.get(df.pathname)
             if info is not None:
                 info.ghidra_analysis_complete = True
+                self._sync_binary_to_notebook(df.pathname, info)
         return df_or_prog
 
     def set_analysis_option(  # noqa: C901
