@@ -60,11 +60,20 @@ def resolve_binary_id(
 
 
 def _get_image_base(program_info: "JvmProgramInfo") -> str | None:
-    """Best-effort image_base from the Ghidra program metadata."""
+    """Best-effort image_base from the Ghidra program metadata.
+
+    Defensive: any non-dict metadata or non-string image_base is treated as
+    "no base" rather than passed downstream (where it would crash SQLite
+    binding or ``to_int``).
+    """
     try:
         meta = getattr(program_info, "metadata", {}) or {}
-        if isinstance(meta, dict):
-            return meta.get("image_base") or meta.get("Image Base")
+        if not isinstance(meta, dict):
+            return None
+        for key in ("image_base", "Image Base"):
+            val = meta.get(key)
+            if isinstance(val, str) and val:
+                return val
     except Exception:
         pass
     return None
@@ -85,14 +94,26 @@ def _source_hash(binary_sha256: str, rva: str, generation: int) -> str:
 
 
 def _resolve_rva(addr: str, program_info: "JvmProgramInfo") -> str:
-    """COnvert an agent-supplied address to canonical RVA."""
+    """Convert an agent-supplied address (or symbol name) to canonical RVA.
+
+    Symbol names (e.g. ``"main"``) cannot be converted to an RVA at the cache
+    layer — return the symbol as-is so the cache miss flows through to Ghidra,
+    which resolves the symbol via its name table.
+    """
     image_base = _get_image_base(program_info)
     if image_base is None:
-        # No base — trust the agent, normalize.
+        # No base — try to normalize; if it's a symbol name, pass it through.
         from ghidra_nexus.notebook.addresses import normalize_hex
 
-        return normalize_hex(addr)
-    n = to_int(addr)
+        try:
+            return normalize_hex(addr)
+        except ValueError:
+            return addr
+    try:
+        n = to_int(addr)
+    except ValueError:
+        # Not a hex address — must be a symbol name.
+        return addr
     base = to_int(image_base) if image_base else 0
     if n >= base and base > 0:
         return to_rva(addr, image_base)

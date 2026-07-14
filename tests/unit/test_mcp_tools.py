@@ -244,7 +244,6 @@ async def test_decompile_exception_returns_typed_error_code(monkeypatch):
     assert response[0].hint
 
 
-@pytest.mark.skip(reason="Pre-existing asyncio hang unrelated to Phase 3; defer to Phase 5")
 @pytest.mark.asyncio
 async def test_decompile_does_not_block_other_tool_calls(monkeypatch):
     pyghidra_context = Mock()

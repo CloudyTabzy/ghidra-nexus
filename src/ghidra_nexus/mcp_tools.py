@@ -163,25 +163,38 @@ _SESSION_ID = __import__("uuid").uuid4().hex[:12]  # per-daemon session id for b
 
 
 async def _get_notebook(pyghidra_context=None) -> Notebook:
-    """Return the per-process notebook singleton, deriving the path from context."""
+    """Return the per-process notebook singleton, deriving the path from context.
+
+    Path resolution order:
+      1. ``NEXUS_NOTEBOOK_PATH`` env var (test isolation; highest priority)
+      2. ``pyghidra_context.nexus_data_dir / notebook.sqlite`` (production)
+      3. Default ``ghidra_nexus_projects/my_project-nexus/notebook.sqlite``
+
+    The env-var override is used by the test suite (see ``tests/unit/conftest.py``)
+    to give each test a tmp_path-based notebook. Without it, all tests share one
+    notebook file and write-through from one test pollutes another.
+    """
     global _NOTEBOOK_SINGLETON
     if _NOTEBOOK_SINGLETON is not None:
         return _NOTEBOOK_SINGLETON
     async with _NOTEBOOK_LOCK:
         if _NOTEBOOK_SINGLETON is not None:
             return _NOTEBOOK_SINGLETON
-        path = "ghidra_nexus_projects/my_project-nexus/notebook.sqlite"
-        if pyghidra_context is not None:
-            ndd = getattr(pyghidra_context, "nexus_data_dir", None)
-            if ndd:
-                from pathlib import Path as _Path
-                path = str(_Path(ndd) / "notebook.sqlite")
+        import os as _os
+        env_path = _os.environ.get("NEXUS_NOTEBOOK_PATH")
+        if env_path:
+            path = env_path
+        else:
+            path = "ghidra_nexus_projects/my_project-nexus/notebook.sqlite"
+            if pyghidra_context is not None:
+                ndd = getattr(pyghidra_context, "nexus_data_dir", None)
+                if ndd:
+                    from pathlib import Path as _Path
+                    path = str(_Path(ndd) / "notebook.sqlite")
         _NOTEBOOK_SINGLETON = Notebook.open(path)
         # Lazily start the embed worker so FTS writes get drained to vec.
         # Best-effort: any failure (missing deps, sqlite-vec unavailable)
         # leaves FTS-only mode intact.
-        # Skip during tests — set NEXUS_DISABLE_EMBED_WORKER=1 in test env.
-        import os as _os
         if not _os.environ.get("NEXUS_DISABLE_EMBED_WORKER"):
             try:
                 _get_embed_worker()
@@ -262,19 +275,29 @@ def _get_binary_meta(
 
     ``generation`` is the analysis_generation from the notebook — 0 on first
     use, bumped by the binary's bump_generation method.
+
+    Defensive: every attribute is validated to be ``str | None`` so a Mock or
+    malformed object (common in unit tests) cannot poison the notebook cache
+    with non-string values that fail SQLite type checking.
     """
     sha256: str = ""
     image_base: str | None = None
     try:
         from ghidra_nexus.context import PyGhidraContext
 
-        sha256 = PyGhidraContext._safe_sha256(program_info) or ""
+        val = PyGhidraContext._safe_sha256(program_info)
+        if isinstance(val, str):
+            sha256 = val
     except Exception:
         pass
     try:
         meta = getattr(program_info, "metadata", None)
         if isinstance(meta, dict):
-            image_base = meta.get("Image Base") or meta.get("image_base")
+            for key in ("Image Base", "image_base"):
+                candidate = meta.get(key)
+                if isinstance(candidate, str) and candidate:
+                    image_base = candidate
+                    break
     except Exception:
         pass
     return sha256, image_base, 0  # generation handled by notebook.binaries via bump_generation

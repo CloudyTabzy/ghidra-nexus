@@ -634,18 +634,23 @@ class PyGhidraContext(IndexingMixin):
     @staticmethod
     def _safe_sha256(program_info) -> str | None:
         """Best-effort sha256 of the on-disk binary (or cached value)."""
+        # Defensive: getattr on a Mock returns a Mock (truthy), which would
+        # bypass the None check and leak a non-string into the SQLite layer.
         cached = getattr(program_info, "cached_sha256", None)
-        if cached:
+        if isinstance(cached, str) and cached:
             return cached
         try:
-            path = program_info.file_path
-            if path is None:
+            path = getattr(program_info, "file_path", None)
+            if not isinstance(path, (str, bytes, os.PathLike)) or path is None:
                 # Fall back to Ghidra metadata keys when present.
-                meta = program_info.metadata or {}
+                meta = getattr(program_info, "metadata", None) or {}
+                if not isinstance(meta, dict):
+                    return None
                 for key in ("Executable SHA-256", "SHA-256", "sha256"):
-                    if meta.get(key):
-                        program_info.cached_sha256 = str(meta[key])
-                        return program_info.cached_sha256
+                    val = meta.get(key)
+                    if isinstance(val, str) and val:
+                        program_info.cached_sha256 = val
+                        return val
                 return None
             p = Path(path)
             if not p.is_file():
