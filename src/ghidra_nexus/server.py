@@ -136,6 +136,8 @@ def register_common_tools(server: FastMCP) -> None:
     server.tool()(mcp_tools.notebook_hypothesis)
     server.tool()(mcp_tools.notebook_embed_status)
     server.tool()(mcp_tools.notebook_rebuild_embeddings)
+    server.tool()(mcp_tools.notebook_archive_breadcrumbs)
+    server.tool()(mcp_tools.notebook_vacuum)
 
 
 def register_gui_tools(server: FastMCP) -> None:

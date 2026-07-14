@@ -30,16 +30,15 @@ if TYPE_CHECKING:
 
 from mcp.server.fastmcp import Context
 from mcp.shared.exceptions import McpError
-from mcp.types import INTERNAL_ERROR, INVALID_PARAMS, ErrorData
+from mcp.types import INTERNAL_ERROR, ErrorData
 
 from ghidra_nexus.context_protocol import MCPContext
 from ghidra_nexus.errors import (
+    ProgramAccessError,
     ToolErrorCode,
-    classify_decompile_failure,
     classify_lookup_failure,
     decompile_failure_result,
     make_tool_error,
-    ProgramAccessError,
 )
 from ghidra_nexus.ghidra_executor import get_executor
 from ghidra_nexus.models import (
@@ -74,10 +73,8 @@ from ghidra_nexus.models import (
     VariableRenameResponse,
     VariableTypeResponse,
 )
-from ghidra_nexus.tools import GhidraTools
-from ghidra_nexus.watchdog import get_watchdog
-
 from ghidra_nexus.notebook.cache import (
+    _resolve_rva,
     check_decompile_cache,
     check_disasm_cache,
     check_strings_cache,
@@ -88,10 +85,11 @@ from ghidra_nexus.notebook.cache import (
     write_disasm_cache,
     write_strings_cache,
     write_xrefs_cache,
-    _resolve_rva,
 )
+from ghidra_nexus.notebook.pagination import clamp_limit
 from ghidra_nexus.notebook.store import Notebook
-from ghidra_nexus.notebook.pagination import DEFAULT_LIMITS, clamp_limit
+from ghidra_nexus.tools import GhidraTools
+from ghidra_nexus.watchdog import get_watchdog
 
 logger = logging.getLogger(__name__)
 
@@ -530,6 +528,107 @@ async def search_symbols_by_name(
     )
 
 
+def _search_code_empty_guard(
+    query: str,
+    search_mode: str,
+    b: dict | None,
+    vec_available: bool,
+    offset: int,
+    limit: int,
+) -> CodeSearchResults | None:
+    """Return a refused-result if the query is empty on a large binary."""
+    if query and query.strip():
+        return None
+    if not (b and b.get("binary_class") in {"large", "very_large"}):
+        return None
+    return CodeSearchResults(
+        results=[],
+        query=query,
+        search_mode=SearchMode(search_mode if search_mode != "hybrid" else "semantic"),
+        vec_available=vec_available,
+        vec_index_complete=False,
+        backend="fts_only",
+        returned_count=0,
+        offset=offset,
+        limit=limit,
+        total_functions=0,
+        literal_total=0,
+        semantic_total=0,
+        reliability_notes=["empty query refused on large/very_large binary"],
+    )
+
+
+def _search_code_semantic_degrade(
+    nb: "Notebook",
+    query: str,
+    binary_name: str,
+    bid: int,
+    search_mode: str,
+    vec_available: bool,
+    vec_index_complete: bool,
+    offset: int,
+    limit: int,
+    preview_length: int,
+) -> CodeSearchResults | None:
+    """Handle semantic-mode unavailable / incomplete cases."""
+    if search_mode != "semantic":
+        return None
+    if not vec_available:
+        raise _ToolRecoverable(
+            ToolErrorCode.SEMANTIC_BACKEND_UNAVAILABLE,
+            f"sqlite-vec is not available; semantic search cannot run for '{binary_name}'.",
+            binary_name=binary_name,
+            fallback_tool="notebook_embed_status",
+            hint=(
+                "Check notebook_embed_status for the vec backend state, "
+                "or use search_mode='hybrid'/'literal'."
+            ),
+        )
+    if vec_index_complete:
+        return None
+
+    from ghidra_nexus.notebook.search import hybrid_search
+
+    result = hybrid_search(
+        nb.conn,
+        query,
+        None,
+        binary_id=bid if bid else None,
+        kind=None,
+        limit=limit,
+        offset=offset,
+        vec_available=False,
+    )
+    hits = [
+        CodeSearchResult(
+            function_name=h.get("name", ""),
+            code=h.get("snippet", "")[:preview_length],
+            similarity=float(h.get("score", 0)),
+            search_mode=SearchMode.LITERAL,
+            preview=h.get("snippet", "")[:preview_length],
+        )
+        for h in result["results"]
+    ]
+    return CodeSearchResults(
+        results=hits,
+        query=query,
+        search_mode=SearchMode.SEMANTIC,
+        vec_available=True,
+        vec_index_complete=False,
+        backend="fts_only",
+        returned_count=result["returned"],
+        offset=offset,
+        limit=limit,
+        total_functions=result["total_fts"],
+        literal_total=result["total_fts"],
+        semantic_total=0,
+        reliability_notes=[
+            "semantic index is still building; returned FTS-only results. "
+            "Call notebook_embed_status to check progress, or retry shortly."
+        ],
+    )
+
+
 @mcp_error_handler
 async def search_code(
     binary_name: str,
@@ -575,19 +674,20 @@ async def search_code(
     b = nb.binaries.get(binary_name)
     bid = b["id"] if b else 0
     vec_available = nb.vec_available
+    vec_index_complete = bool((b or {}).get("vec_index_complete", 0))
 
-    # F1 capability envelope: refuse empty query on very_large binaries to
-    # avoid unbounded scans (reliability_notes from classify_binary()).
-    if not query or not query.strip():
-        if b and b.get("binary_class") in {"large", "very_large"}:
-            return CodeSearchResults(
-                results=[], query=query,
-                search_mode=SearchMode(search_mode if search_mode != "hybrid" else "semantic"),
-                vec_available=vec_available, vec_index_complete=False,
-                backend="fts_only", returned_count=0, offset=offset, limit=limit,
-                total_functions=0, literal_total=0, semantic_total=0,
-                reliability_notes=["empty query refused on large/very_large binary"],
-            )
+    empty_guard = _search_code_empty_guard(
+        query, search_mode, b, vec_available, offset, limit
+    )
+    if empty_guard is not None:
+        return empty_guard
+
+    semantic_degrade = _search_code_semantic_degrade(
+        nb, query, binary_name, bid, search_mode, vec_available, vec_index_complete,
+        offset, limit, preview_length,
+    )
+    if semantic_degrade is not None:
+        return semantic_degrade
 
     query_vec = None
     if vec_available and search_mode in ("semantic", "hybrid"):
@@ -606,9 +706,6 @@ async def search_code(
             nb.conn, result["results"], min_quality
         )
         result["returned"] = len(result["results"])
-
-    # Resolve vec_index_complete from notebook
-    vec_index_complete = bool((b or {}).get("vec_index_complete", 0))
 
     hits = []
     for h in result["results"]:
@@ -988,6 +1085,21 @@ async def search_strings(
     sha256, image_base, _gen = _get_binary_meta(pyghidra_context, binary_name, program_info)
     bid = resolve_binary_id(nb, binary_name, sha256, image_base=image_base)
 
+    # F1 hard gate: very_large binaries require a non-trivial query to avoid
+    # unbounded string scans. Short/empty patterns are rejected with a fallback.
+    b = nb.binaries.get(binary_name) if nb else None
+    binary_class = (b or {}).get("binary_class", "unknown")
+    is_very_large = isinstance(binary_class, str) and binary_class.startswith("very_large")
+    query_stripped = query.strip() if isinstance(query, str) else ""
+    if is_very_large and len(query_stripped) < 3:
+        raise _ToolRecoverable(
+            ToolErrorCode.INVALID_PARAMS,
+            f"String scan on very_large binary '{binary_name}' requires a query of at least 3 characters.",
+            binary_name=binary_name,
+            fallback_tool="notebook_search",
+            hint="Narrow the search with a longer substring, or use notebook_search over cached views.",
+        )
+
     cached = check_strings_cache(nb, binary_id=bid, pattern=query, offset=offset, limit=limit)
     if cached is not None:
         return StringSearchResults(
@@ -1094,7 +1206,164 @@ async def gen_callgraph(
     )
 
 
+def _resolve_live_program_info(pyghidra_context, name: str):
+    """Return the live ProgramInfo for ``name`` if it is currently open."""
+    try:
+        with getattr(pyghidra_context, "_programs_lock", threading.Lock()):
+            programs = getattr(pyghidra_context, "programs", {}) or {}
+            return programs.get(name)
+    except Exception:
+        return None
+
+
+def _resolve_function_count(raw, live_pi, pyghidra_context) -> int:
+    """Prefer live function count, fall back to raw/metadata."""
+    from ghidra_nexus.context import PyGhidraContext
+
+    count = int(getattr(raw, "function_count", 0) or 0)
+    if isinstance(raw.metadata, dict) and not count:
+        count = int(raw.metadata.get("function_count") or 0)
+    if live_pi is not None:
+        try:
+            count = PyGhidraContext._safe_function_count(live_pi) or count
+        except Exception:
+            pass
+    return count
+
+
+def _resolve_sha256(raw, live_pi) -> str | None:
+    """Prefer live sha256, fall back to raw/metadata."""
+    from ghidra_nexus.context import PyGhidraContext
+
+    sha256 = getattr(raw, "sha256", None)
+    if isinstance(raw.metadata, dict) and not sha256:
+        sha256 = raw.metadata.get("sha256")
+    if live_pi is not None:
+        try:
+            sha256 = PyGhidraContext._safe_sha256(live_pi) or sha256
+        except Exception:
+            pass
+    return sha256
+
+
+def _resolve_entropy_summary(raw, live_pi, pyghidra_context) -> str:
+    """Prefer live entropy summary, fall back to raw/metadata."""
+    entropy_summary = getattr(raw, "entropy_summary", None) or "unknown"
+    if isinstance(raw.metadata, dict) and entropy_summary in (None, "unknown", "normal"):
+        entropy_summary = raw.metadata.get("entropy_summary") or entropy_summary
+    if live_pi is None:
+        return entropy_summary or "unknown"
+
+    ensure = getattr(pyghidra_context, "ensure_entropy_summary", None)
+    if callable(ensure):
+        try:
+            return ensure(live_pi) or entropy_summary or "unknown"
+        except Exception:
+            pass
+    if getattr(live_pi, "entropy_summary", None):
+        return live_pi.entropy_summary
+    return entropy_summary or "unknown"
+
+
+def _compute_state_and_recommendations(raw, function_count: int) -> tuple[str, list[str]]:
+    """Return (analysis_state, recommended_tools) from raw status + live count."""
+    if raw.analysis_complete:
+        state = "complete"
+        if function_count == 0:
+            recommended = ["section_health", "survey_binary_fast"]
+        elif getattr(raw, "code_indexed", False):
+            recommended = ["survey_binary_full", "search_code"]
+        else:
+            recommended = ["section_health", "survey_binary_full"]
+    else:
+        state = getattr(raw, "analysis_state", None) or "analyzing_functions"
+        recommended = ["survey_binary_fast", "section_health", "analysis_status"]
+    return state, recommended
+
+
+def _path_exists(file_path: str | None) -> bool | None:
+    """Best-effort check whether ``file_path`` exists on disk."""
+    if not file_path:
+        return None
+    try:
+        return Path(file_path).exists()
+    except Exception:
+        return None
+
+
+def _notebook_counts(nb, bid: int | None) -> dict[str, int]:
+    """Return cache counters from the notebook for ``bid``."""
+    counts = {
+        "cached_decompiles": 0,
+        "cached_disassemblies": 0,
+        "artifact_views": 0,
+        "embedded_count": 0,
+    }
+    if bid is None or nb is None:
+        return counts
+    try:
+        counts["cached_decompiles"] = nb.decompiles.count_for_binary(bid)
+        counts["cached_disassemblies"] = nb.disassemblies.count_for_binary(bid)
+        counts["artifact_views"] = nb.views.count_for_binary(bid)
+        counts["embedded_count"] = nb.embeddings.count_for_binary(bid)
+    except Exception:
+        pass
+    return counts
+
+
 @mcp_error_handler
+def _build_program_info(
+    raw,
+    *,
+    pyghidra_context,
+    nb,
+    project_path_str: str | None,
+    nexus_dir_str: str | None,
+) -> ProgramInfo:
+    """Build a single enriched ProgramInfo from Ghidra + notebook state."""
+    vec_data = nb.binaries.get(raw.name) if nb else {}
+    bid = vec_data.get("id") if vec_data else None
+
+    live_pi = _resolve_live_program_info(pyghidra_context, raw.name)
+    function_count = _resolve_function_count(raw, live_pi, pyghidra_context)
+    sha256 = _resolve_sha256(raw, live_pi)
+    entropy_summary = _resolve_entropy_summary(raw, live_pi, pyghidra_context)
+    state, recommended = _compute_state_and_recommendations(raw, function_count)
+    path_exists = _path_exists(raw.file_path)
+    counts = _notebook_counts(nb, bid)
+
+    return ProgramInfo(
+        name=raw.name,
+        file_path=raw.file_path,
+        load_time=raw.load_time,
+        analysis_complete=raw.analysis_complete,
+        metadata=raw.metadata if isinstance(raw.metadata, dict) else {},
+        code_indexed=raw.code_indexed,
+        strings_indexed=raw.strings_indexed,
+        analysis_state=state,
+        function_count=function_count,
+        sha256=sha256,
+        entropy_summary=entropy_summary,
+        project_path=project_path_str,
+        nexus_data_dir=nexus_dir_str,
+        idb_path=raw.file_path,
+        path_exists=path_exists,
+        recommended_tools=recommended,
+        vec_available=nb.vec_available if nb else False,
+        vec_status=vec_data.get("vec_status", "unavailable") if vec_data else "unavailable",
+        vec_index_complete=bool(vec_data.get("vec_index_complete", 0)) if vec_data else False,
+        embed_progress=vec_data.get("embed_progress", 0) if vec_data else 0,
+        embed_target=vec_data.get("embed_target", 0) if vec_data else 0,
+        embed_model=vec_data.get("embed_model") if vec_data else None,
+        binary_class=vec_data.get("binary_class", "unknown") if vec_data else "unknown",
+        analysis_ready=bool(vec_data.get("analysis_ready", 0)) if vec_data else False,
+        cached_decompiles=counts["cached_decompiles"],
+        cached_disassemblies=counts["cached_disassemblies"],
+        artifact_views=counts["artifact_views"],
+        embedded_count=counts["embedded_count"],
+    )
+
+
 async def analysis_status(ctx: Context) -> AnalysisStatusResult:
     """Show analysis progress + project-level warnings.
 
@@ -1108,6 +1377,12 @@ async def analysis_status(ctx: Context) -> AnalysisStatusResult:
         - ``function_count`` — live count from Ghidra; ``0`` means not analyzed yet
         - ``entropy_summary`` — top-level entropy profile (encrypted / compressed /
           normal / mixed / unknown)
+        - ``binary_class`` / ``analysis_ready`` — notebook capability envelope (F1)
+        - ``cached_decompiles`` / ``cached_disassemblies`` / ``artifact_views`` /
+          ``embedded_count`` — notebook cache state
+        - ``vec_status`` / ``vec_available`` / ``vec_index_complete`` /
+          ``embed_progress`` / ``embed_target`` / ``embed_model`` — semantic
+          readiness
         - ``project_path`` / ``nexus_data_dir`` / ``idb_path`` — absolute paths
           the agent can validate against ``os.path.exists``
         - ``recommended_tools`` — what to call next given current state
@@ -1118,7 +1393,6 @@ async def analysis_status(ctx: Context) -> AnalysisStatusResult:
           project writes silently fail.
     """
     from ghidra_nexus import __version__
-    from ghidra_nexus.context import PyGhidraContext
     from ghidra_nexus.server import _check_project_path_writable
 
     pyghidra_context = _get_context(ctx)
@@ -1128,99 +1402,16 @@ async def analysis_status(ctx: Context) -> AnalysisStatusResult:
     project_path_str = str(getattr(pyghidra_context, "project_path", None) or "") or None
     nexus_dir_str = str(getattr(pyghidra_context, "nexus_data_dir", None) or "") or None
 
-    binaries: list[ProgramInfo] = []
-    for raw in raw_infos:
-        # Notebook binary data for vec fields
-        vec_data = nb.binaries.get(raw.name) if nb else {}
-        # Prefer fields already enriched by list_project_binary_infos.
-        function_count = int(getattr(raw, "function_count", 0) or 0)
-        sha256 = getattr(raw, "sha256", None)
-        entropy_summary = getattr(raw, "entropy_summary", None) or "unknown"
-        if isinstance(raw.metadata, dict):
-            if not function_count:
-                function_count = int(raw.metadata.get("function_count") or 0)
-            if not sha256:
-                sha256 = raw.metadata.get("sha256")
-            if entropy_summary in (None, "unknown", "normal") and raw.metadata.get(
-                "entropy_summary"
-            ):
-                entropy_summary = raw.metadata["entropy_summary"]
-
-        # Live re-count from the open program when possible (truthful status).
-        live_pi = None
-        try:
-            with getattr(pyghidra_context, "_programs_lock", threading.Lock()):
-                programs = getattr(pyghidra_context, "programs", {}) or {}
-                live_pi = programs.get(raw.name)
-        except Exception:
-            live_pi = None
-
-        if live_pi is not None:
-            try:
-                function_count = PyGhidraContext._safe_function_count(live_pi)
-            except Exception:
-                pass
-            try:
-                sha256 = PyGhidraContext._safe_sha256(live_pi) or sha256
-            except Exception:
-                pass
-            # Cheap cached entropy pass (once per binary per daemon lifetime).
-            ensure = getattr(pyghidra_context, "ensure_entropy_summary", None)
-            if callable(ensure):
-                try:
-                    entropy_summary = ensure(live_pi)
-                except Exception:
-                    pass
-            elif getattr(live_pi, "entropy_summary", None):
-                entropy_summary = live_pi.entropy_summary
-
-        if raw.analysis_complete:
-            state = "complete"
-            if function_count == 0:
-                # Analysis finished but no functions — agent should not treat as
-                # a healthy binary (packed / empty / wrong loader).
-                recommended = ["section_health", "survey_binary_fast"]
-            elif getattr(raw, "code_indexed", False):
-                recommended = ["survey_binary_full", "search_code"]
-            else:
-                recommended = ["section_health", "survey_binary_full"]
-        else:
-            state = getattr(raw, "analysis_state", None) or "analyzing_functions"
-            recommended = ["survey_binary_fast", "section_health", "analysis_status"]
-
-        file_path = raw.file_path
-        path_exists: bool | None = None
-        if file_path:
-            try:
-                path_exists = Path(file_path).exists()
-            except Exception:
-                path_exists = None
-
-        binaries.append(
-            ProgramInfo(
-                name=raw.name,
-                file_path=file_path,
-                load_time=raw.load_time,
-                analysis_complete=raw.analysis_complete,
-                metadata=raw.metadata if isinstance(raw.metadata, dict) else {},
-                code_indexed=raw.code_indexed,
-                strings_indexed=raw.strings_indexed,
-                analysis_state=state,
-                function_count=function_count,
-                sha256=sha256,
-                entropy_summary=entropy_summary or "unknown",
-                project_path=project_path_str,
-                nexus_data_dir=nexus_dir_str,
-                idb_path=file_path,
-                path_exists=path_exists,
-                recommended_tools=recommended,
-                vec_available=nb.vec_available if nb else False,
-                vec_index_complete=bool(vec_data.get("vec_index_complete", 0)) if vec_data else False,
-                embed_progress=vec_data.get("embed_progress", 0) if vec_data else 0,
-                embed_target=vec_data.get("embed_target", 0) if vec_data else 0,
-                embed_model=vec_data.get("embed_model") if vec_data else None,
-            )
+    binaries = [
+        _build_program_info(
+            raw,
+            pyghidra_context=pyghidra_context,
+            nb=nb,
+            project_path_str=project_path_str,
+            nexus_dir_str=nexus_dir_str,
         )
+        for raw in raw_infos
+    ]
 
     warnings: list[str] = []
     try:
@@ -1496,7 +1687,7 @@ async def notebook_hypothesis(action: str, ctx: Context, id: int | None = None, 
         hid = nb.hypotheses.create(text=text or "", binary_id=bid, status=status or "open")
         return nb.hypotheses.get(hid) or {"id": hid}
     elif action == "update" and id is not None:
-        nb.hypotheses.update(id, status=status or "open", **(({"text": text} if text else {})))
+        nb.hypotheses.update(id, status=status or "open", **({"text": text} if text else {}))
         return nb.hypotheses.get(id) or {}
     elif action == "list":
         return {"hypotheses": nb.hypotheses.list(binary_id=bid, status=status)}
@@ -1651,6 +1842,100 @@ async def notebook_rebuild_embeddings(
 
 
 @mcp_error_handler
+async def notebook_archive_breadcrumbs(
+    ctx: Context,
+    binary_name: str | None = None,
+    session_id: str | None = None,
+    age_days: int = 30,
+) -> dict:
+    """Archive (and delete) breadcrumbs older than ``age_days``.
+
+    The archive table preserves audit history; the hot ``breadcrumbs`` table
+    stays small. If ``binary_name`` is given, only crumbs for that binary are
+    archived. If ``session_id`` is given, only that session is targeted.
+    """
+    nb = await _get_notebook()
+    bid = None
+    if binary_name:
+        b = nb.binaries.get(binary_name)
+        if not b:
+            raise _ToolRecoverable(
+                ToolErrorCode.BINARY_NOT_FOUND,
+                f"Binary {binary_name!r} not in notebook",
+                binary_name=binary_name,
+            )
+        bid = b["id"]
+
+    result = nb.breadcrumbs.archive_old(
+        binary_id=bid, session_id=session_id, age_days=max(1, age_days)
+    )
+    return {
+        "archived": result["archived"],
+        "deleted": result["deleted"],
+        "age_days": max(1, age_days),
+        "binary_name": binary_name,
+        "session_id": session_id,
+    }
+
+
+@mcp_error_handler
+async def notebook_vacuum(
+    ctx: Context,
+    binary_name: str | None = None,
+    keep_generations: int = 2,
+    run_vacuum: bool = False,
+) -> dict:
+    """Reclaim notebook space by deleting stale cache generations.
+
+    Keeps the newest ``keep_generations`` of decompiles and disassemblies per
+    binary. Set ``run_vacuum=True`` to run SQLite ``VACUUM`` afterward, which
+    rewires the DB file and requires temporary disk space (~2x the file size).
+    """
+    nb = await _get_notebook()
+    if keep_generations < 1:
+        raise _ToolRecoverable(
+            ToolErrorCode.INVALID_PARAMS,
+            "keep_generations must be >= 1",
+        )
+
+    targets: list[tuple[int, str]] = []
+    if binary_name:
+        b = nb.binaries.get(binary_name)
+        if not b:
+            raise _ToolRecoverable(
+                ToolErrorCode.BINARY_NOT_FOUND,
+                f"Binary {binary_name!r} not in notebook",
+                binary_name=binary_name,
+            )
+        targets.append((b["id"], b["name"]))
+    else:
+        for b in nb.binaries.all():
+            targets.append((b["id"], b["name"]))
+
+    total_decompiles = 0
+    total_disassemblies = 0
+    for bid, _name in targets:
+        total_decompiles += nb.decompiles.delete_old_generations(bid, keep_generations)
+        total_disassemblies += nb.disassemblies.delete_old_generations(bid, keep_generations)
+
+    freed_note = "VACUUM not run; set run_vacuum=True to reclaim file space."
+    if run_vacuum:
+        try:
+            nb.conn.execute("VACUUM")
+            freed_note = "VACUUM completed successfully."
+        except Exception as e:
+            freed_note = f"VACUUM failed: {e}"
+
+    return {
+        "binaries_affected": [name for _, name in targets],
+        "decompiles_deleted": total_decompiles,
+        "disassemblies_deleted": total_disassemblies,
+        "keep_generations": keep_generations,
+        "vacuum_note": freed_note,
+    }
+
+
+@mcp_error_handler
 async def save(ctx: Context) -> SaveRequestResult:
     pyghidra_context = _get_context(ctx)
     pyghidra_context.save()
@@ -1695,6 +1980,8 @@ def _register_all_on_demand(mcp_server):
         (notebook_hypothesis, "notebook_hypothesis"),
         (notebook_embed_status, "notebook_embed_status"),
         (notebook_rebuild_embeddings, "notebook_rebuild_embeddings"),
+        (notebook_archive_breadcrumbs, "notebook_archive_breadcrumbs"),
+        (notebook_vacuum, "notebook_vacuum"),
     ]
     for fn, name in tools:
         try:
@@ -1721,7 +2008,6 @@ async def wake_ghidra(ctx: Context) -> str:
             return "Ghidra is already awake."
         _AWAKE = True
 
-    import time as _time
     logger.info("wake_ghidra: starting Ghidra JVM...")
     t0 = _time.time()
 

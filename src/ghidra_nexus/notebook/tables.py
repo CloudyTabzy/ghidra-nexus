@@ -292,6 +292,25 @@ class DecompilesManager:
         ).fetchone()
         return int(row[0]) if row else 0
 
+    def delete_old_generations(self, binary_id: int, keep_generations: int = 2) -> int:
+        """Delete decompiles rows whose generation is older than the newest N."""
+        if keep_generations < 1:
+            keep_generations = 1
+        with self.nb.transaction() as conn:
+            before = conn.total_changes
+            conn.execute(
+                """DELETE FROM decompiles
+                   WHERE binary_id = ?
+                     AND analysis_generation < (
+                         SELECT MIN(analysis_generation) FROM (
+                             SELECT DISTINCT analysis_generation FROM decompiles
+                             WHERE binary_id = ? ORDER BY analysis_generation DESC LIMIT ?
+                         )
+                     )""",
+                (binary_id, binary_id, keep_generations),
+            )
+            return conn.total_changes - before
+
 
 # ---------------------------------------------------------------------------
 # disassemblies
@@ -342,6 +361,25 @@ class DisassembliesManager:
             "SELECT COUNT(*) FROM disassemblies WHERE binary_id = ?", (binary_id,)
         ).fetchone()
         return int(row[0]) if row else 0
+
+    def delete_old_generations(self, binary_id: int, keep_generations: int = 2) -> int:
+        """Delete disassembly rows whose generation is older than the newest N."""
+        if keep_generations < 1:
+            keep_generations = 1
+        with self.nb.transaction() as conn:
+            before = conn.total_changes
+            conn.execute(
+                """DELETE FROM disassemblies
+                   WHERE binary_id = ?
+                     AND analysis_generation < (
+                         SELECT MIN(analysis_generation) FROM (
+                             SELECT DISTINCT analysis_generation FROM disassemblies
+                             WHERE binary_id = ? ORDER BY analysis_generation DESC LIMIT ?
+                         )
+                     )""",
+                (binary_id, binary_id, keep_generations),
+            )
+            return conn.total_changes - before
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +511,58 @@ class BreadcrumbsManager:
         sql += " ORDER BY ts DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
         return [dict(r) for r in self.nb.conn.execute(sql, params).fetchall()]
+
+    def archive_old(
+        self,
+        *,
+        binary_id: int | None = None,
+        session_id: str | None = None,
+        age_days: int = 30,
+    ) -> dict:
+        """Copy breadcrumbs older than ``age_days`` to archive, then delete them.
+
+        Returns ``{"archived": int, "deleted": int}``. The archive table is
+        created by migration 002; if it does not exist, this falls back to a
+        plain delete and reports ``archived: 0``.
+        """
+        archived = 0
+        deleted = 0
+        cutoff = int(time.time()) - age_days * 86400
+
+        # Build the candidate filter.
+        where = "ts < datetime(?, 'unixepoch')"
+        params: list = [cutoff]
+        if binary_id is not None:
+            where += " AND binary_id = ?"
+            params.append(binary_id)
+        if session_id is not None:
+            where += " AND session_id = ?"
+            params.append(session_id)
+
+        with self.nb.transaction() as conn:
+            # Best-effort archive copy. If the archive table is missing (very
+            # old DB or manual schema change), just delete.
+            try:
+                before = conn.total_changes
+                conn.execute(
+                    f"""INSERT INTO breadcrumbs_archive
+                        (original_id, binary_id, session_id, ts, tool, args_hash,
+                         summary, rva, duration_ms, truncated, error_code)
+                        SELECT id, binary_id, session_id, ts, tool, args_hash,
+                               summary, rva, duration_ms, truncated, error_code
+                        FROM breadcrumbs WHERE {where}""",
+                    params,
+                )
+                archived = conn.total_changes - before
+            except sqlite3.OperationalError as e:
+                if "no such table" not in str(e).lower():
+                    raise
+
+            before = conn.total_changes
+            conn.execute(f"DELETE FROM breadcrumbs WHERE {where}", params)
+            deleted = conn.total_changes - before
+
+        return {"archived": archived, "deleted": deleted}
 
 
 # ---------------------------------------------------------------------------

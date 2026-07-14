@@ -8,8 +8,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Union
 
-import chromadb
-
 from ghidra_nexus.decompiler_pool import DecompilerPool
 from ghidra_nexus.import_detection import is_ghidra_importable
 from ghidra_nexus.import_planning import ImportCandidate, build_import_plan
@@ -43,7 +41,7 @@ class ProgramInfo:
     ghidra_analysis_complete: bool
     file_path: Path | None = None
     load_time: float | None = None
-    code_collection: chromadb.Collection | None = None
+    code_collection: Any | None = None
     strings: list | None = None
     rw_lock: threading.RLock = field(default_factory=threading.RLock)
     dead: bool = False

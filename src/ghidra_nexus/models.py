@@ -108,10 +108,19 @@ class ProgramInfo(BaseModel):
 
     # Phase 3 vec readiness fields
     vec_available: bool = False
+    vec_status: str = "unavailable"
     vec_index_complete: bool = False
     embed_progress: int = 0
     embed_target: int = 0
     embed_model: str | None = None
+
+    # Phase 5 knowledge-plane status fields
+    binary_class: str = "unknown"
+    analysis_ready: bool = False
+    cached_decompiles: int = 0
+    cached_disassemblies: int = 0
+    artifact_views: int = 0
+    embedded_count: int = 0
 
 
 class AnalysisStatusResult(BaseModel):
@@ -414,6 +423,12 @@ class CodeSearchResults(BaseModel):
     vec_available: bool = Field(False, description="True when sqlite-vec is loaded.")
     vec_index_complete: bool = Field(False, description="True when all views for this binary are embedded.")
     backend: str = Field("unknown", description="Which search backend served this query: sqlite_vec, fts_only, chromadb, hybrid.")
+
+    # Phase 5 capability envelope notes
+    reliability_notes: list[str] = Field(
+        default_factory=list,
+        description="Human-readable notes about result confidence or fallback behavior.",
+    )
 
 
 class StringInfo(BaseModel):

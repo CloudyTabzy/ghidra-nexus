@@ -137,6 +137,8 @@ REGISTERED_TOOL_NAMES: frozenset[str] = frozenset(
         "notebook_hypothesis",
         "notebook_embed_status",
         "notebook_rebuild_embeddings",
+        "notebook_archive_breadcrumbs",
+        "notebook_vacuum",
     }
 )
 

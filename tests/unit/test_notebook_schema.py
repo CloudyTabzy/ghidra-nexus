@@ -10,7 +10,7 @@ import pytest
 
 from ghidra_nexus.notebook import Notebook
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @pytest.fixture
@@ -38,9 +38,9 @@ class TestMigrations:
     def test_all_tables_exist(self, nb):
         tables = {
             "binaries", "functions", "decompiles", "disassemblies",
-            "xrefs", "strings", "breadcrumbs", "aliases", "hypotheses",
-            "artifact_views", "embeddings", "embed_queue",
-            "fts",  # virtual table
+            "xrefs", "strings", "breadcrumbs", "breadcrumbs_archive",
+            "aliases", "hypotheses", "artifact_views", "embeddings",
+            "embed_queue", "fts",  # virtual table
         }
         rows = nb._conn.execute(
             "SELECT name FROM sqlite_master WHERE type in ('table', 'view')"

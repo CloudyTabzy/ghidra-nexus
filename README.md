@@ -23,11 +23,13 @@ GhidraNexus is a [Model Context Protocol (MCP)](https://modelcontextprotocol.io)
 
 Today this means: a single-thread JVM funnel that prevents Ghidra deadlocks, per-program locks for
 safe concurrent binaries, lazy JVM activation so HTTP transports boot instantly, watchdog telemetry,
-ChromaDB semantic indexing, and a stable tool surface.
+a stable tool surface, and a **persistent notebook** — SQLite + FTS5 caches for every decompile /
+disassemble / xref call, plus sqlite-vec hybrid semantic search.
 
-Soon it means a **persistent notebook** — SQLite + FTS5 caches for every decompile / disassemble /
-xref call, so the agent never re-decodes the same function twice and never forgets what it analyzed
-yesterday. See `Implementations/` for the phase-by-phase plan.
+ChromaDB is still supported via `NEXUS_SEMANTIC_BACKEND=chromadb` but is now an optional,
+second-class backend. The default knowledge plane is entirely local SQLite.
+
+See `Implementations/` for the phase-by-phase plan.
 
 ---
 
@@ -73,8 +75,9 @@ uv run ghidra-nexus
 | **Lifecycle** | `import_binary`, `delete_project_binary`, `analysis_status`, `save` |
 | **Triage** | `survey_binary_fast` / `survey_binary_full`, `section_health` |
 | **Read** | `decompile_function`, `disassemble`, `list_imports`, `list_exports`, `search_strings`, `list_xrefs`, `gen_callgraph`, `read_bytes` |
-| **Search** | `search_symbols_by_name`, `search_code` (semantic via ChromaDB) |
+| **Search** | `search_symbols_by_name`, `search_code` (sqlite-vec hybrid; ChromaDB optional) |
 | **Write** | `rename_function`, `rename_variable`, `set_variable_type`, `set_function_prototype`, `set_comment` |
+| **Notebook** | `notebook_summary`, `notebook_search`, `notebook_breadcrumbs`, `notebook_alias`, `notebook_hypothesis`, `notebook_embed_status`, `notebook_rebuild_embeddings`, `notebook_archive_breadcrumbs`, `notebook_vacuum` |
 | **Lazy** | `wake_ghidra`, `ghidra_status` (HTTP transport only — boots JVM on first call) |
 
 ---
@@ -98,8 +101,57 @@ uv run ghidra-nexus
 - `project_path` / `nexus_data_dir` / `idb_path` — absolute paths to validate
 
 `analysis_status` is the source of truth: live `function_count`, `sha256`,
-`entropy_summary`, `path_warnings` (UAC-locked project paths), and
+`entropy_summary`, `path_warnings` (UAC-locked project paths), cache counters
+(`cached_decompiles`, `cached_disassemblies`, `artifact_views`, `embedded_count`),
+vec readiness (`vec_available`, `vec_index_complete`, `embed_progress`), and
 `recommended_tools` for the next call.
+
+## Knowledge plane
+
+Every read-heavy tool checks the notebook SQLite cache first. On miss, the full
+blob is gzipped and stored, a distilled `summary` + `key_entities` view is
+extracted, FTS5 is updated, and the view is queued for sqlite-vec embedding.
+
+```
+MCP handler
+    │  cache hit → windowed response (offset/limit/has_more)
+    ▼
+Ghidra executor (JVM) → gzipped blob
+    ▼
+Extractor → artifact_view (summary + entities)
+    ▼
+FTS5 + sqlite-vec
+```
+
+### Pagination defaults
+
+| Tool | Default limit | Max |
+|------|--------------:|----:|
+| `decompile_function` | 200 lines | 1,000 |
+| `disassemble` | caller's `count` | 200 insns |
+| `list_xrefs` | 50 | 500 |
+| `search_strings` | 100 | 1,000 |
+| `search_code` | 5 | 50 |
+| `notebook_breadcrumbs` | 50 | 500 |
+
+### `search_code` modes
+
+- `hybrid` (default): FTS5 + sqlite-vec KNN → RRF merge.
+- `literal`: FTS5 only; works even when vec is unavailable.
+- `semantic`: sqlite-vec KNN only. Returns a typed error if vec is unavailable,
+  or FTS-only partial results with a note if the index is still building.
+
+Set `NEXUS_SEMANTIC_BACKEND=chromadb` to use the legacy ChromaDB path; it is
+not recommended for new projects.
+
+### Maintenance
+
+- `notebook_archive_breadcrumbs(age_days=30)` — move old audit crumbs to
+  `breadcrumbs_archive` and delete them from the hot table.
+- `notebook_vacuum(keep_generations=2, run_vacuum=False)` — delete stale
+  decompile/disassembly generations and optionally `VACUUM` the SQLite file.
+- `notebook_rebuild_embeddings(binary_name=None)` — drop and re-queue embeddings
+  after a model change or stuck index.
 
 ### `section_health`
 
@@ -151,7 +203,7 @@ Tools that work **during** analysis (no hard block): `survey_binary_fast`,
 
 ```
 MCP handlers (asyncio)
-        │  executor.submit(program_info, fn)
+        │  notebook cache first (SQLite + FTS5 + sqlite-vec)
         ▼
   GhidraExecutor  (single background thread, runs ALL Ghidra API calls)
         │  acquires program_info.rw_lock
@@ -161,11 +213,9 @@ MCP handlers (asyncio)
 
 - Single JVM thread = zero `DecompInterface` deadlocks, zero write races
 - Per-program `RLock` = different binaries truly parallel
-- `DerivedState` (no stale flags) = every tool sees current pipeline state
+- Notebook cache-first = sub-millisecond reads, full provenance, no re-decode
+- sqlite-vec = primary semantic backend; ChromaDB optional via env var
 - RE-MCP stdio pattern = JVM owns main thread, FastMCP runs as daemon
-
-The **notebook** lands in Phase 1 (see `Implementations/`). After that, the architecture adds a
-SQLite cache between the MCP handler and the executor so common reads are sub-millisecond.
 
 ---
 
@@ -181,8 +231,8 @@ ghidra-nexus/                       ← THE repo
 │   ├── watchdog.py                 ← telemetry / stall / queue / error monitor
 │   ├── tools.py                    ← GhidraTools (pure Ghidra API calls)
 │   ├── mcp_tools.py                ← MCP tool handlers → executor dispatch
-│   ├── indexing_mixin.py           ← ChromaDB semantic indexing
-│   ├── notebook/                   ← **Phase 1+ — persistent notebook**
+│   ├── indexing_mixin.py           ← optional ChromaDB backend
+│   ├── notebook/                   ← persistent SQLite knowledge plane
 │   ├── models.py                   ← Pydantic request/response models
 │   ├── project_spec.py             ← project path normalizer
 │   ├── import_planning.py          ← import candidate planner

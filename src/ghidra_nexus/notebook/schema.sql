@@ -7,4 +7,5 @@
 -- This file is **not** executed; it's documentation. To change the schema,
 -- add `_migrations/00N_<name>.sql` and update this mirror.
 
--- See `_migrations/001_initial.sql`.
+-- See `_migrations/001_initial.sql` for the foundation schema.
+-- See `_migrations/002_breadcrumbs_archive.sql` for the Phase 5 archive table.

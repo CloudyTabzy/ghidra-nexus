@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 
 
 MIGRATIONS_DIR = Path(__file__).parent / "_migrations"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @dataclass
