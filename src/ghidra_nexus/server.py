@@ -80,8 +80,8 @@ def _check_project_path_writable(project_path: Path) -> list[str]:
         if candidate in _WINDOWS_LOCKED_PATHS:
             warnings.append(
                 f"project_path={project_path} lives under {candidate}, a UAC-locked "
-                f"directory on Windows; IDA writes may fail silently. Move the project "
-                f"to ~/analysis or another writable location before importing binaries."
+                f"directory on Windows; Ghidra project writes may fail silently. Move "
+                f"the project to ~/analysis or another writable location before importing."
             )
             break
     # Try a write-test only when the path exists; missing path is fine (we'll

@@ -11,7 +11,9 @@ class MCPContext(Protocol):
 
     programs: dict[str, "ProgramInfo"]
 
-    def get_program_info(self, binary_name: str) -> "ProgramInfo": ...
+    def get_program_info(
+        self, binary_name: str, *, require_analysis: bool = True
+    ) -> "ProgramInfo": ...
 
     def list_binaries(self) -> list[str]: ...
 

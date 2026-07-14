@@ -1,5 +1,4 @@
 import concurrent.futures
-import json
 import logging
 import threading
 import time
@@ -490,6 +489,9 @@ class GuiPyGhidraContext(IndexingMixin):
             return list(self.programs.values())
 
     def list_project_binary_infos(self) -> list[ProgramInfoModel]:
+        """Return MCP models for project binaries, enriched with live counts."""
+        from ghidra_nexus.context import PyGhidraContext
+
         self.refresh_programs()
         with self._programs_lock:
             live_programs = dict(self.programs)
@@ -499,15 +501,31 @@ class GuiPyGhidraContext(IndexingMixin):
             path = str(domain_file.getPathname())
             live_info = live_programs.get(path)
             if live_info is not None:
+                meta = dict(live_info.metadata or {})
+                function_count = PyGhidraContext._safe_function_count(live_info)
+                sha256 = PyGhidraContext._safe_sha256(live_info)
+                if sha256:
+                    meta["sha256"] = sha256
+                meta["function_count"] = function_count
+                entropy = getattr(live_info, "entropy_summary", "unknown") or "unknown"
+                meta["entropy_summary"] = entropy
+                file_path = str(live_info.file_path) if live_info.file_path else None
                 program_infos.append(
                     ProgramInfoModel(
                         name=path,
-                        file_path=str(live_info.file_path) if live_info.file_path else None,
+                        file_path=file_path,
                         load_time=live_info.load_time,
                         analysis_complete=live_info.analysis_complete,
-                        metadata=live_info.metadata,
+                        metadata=meta,
                         code_indexed=live_info.code_collection is not None,
                         strings_indexed=live_info.strings is not None,
+                        analysis_state=(
+                            "complete" if live_info.analysis_complete else "analyzing_functions"
+                        ),
+                        function_count=function_count,
+                        sha256=sha256,
+                        entropy_summary=entropy,
+                        idb_path=file_path,
                     )
                 )
                 continue
@@ -524,27 +542,46 @@ class GuiPyGhidraContext(IndexingMixin):
                     metadata=metadata,
                     code_indexed=False,
                     strings_indexed=False,
+                    analysis_state="complete" if analyzed_value == "true" else "analyzing_functions",
+                    function_count=int(metadata.get("function_count") or 0),
+                    sha256=metadata.get("Executable SHA-256") or metadata.get("sha256"),
+                    entropy_summary="unknown",
+                    idb_path=executable_location,
                 )
             )
         return program_infos
 
-    def get_program_info(self, binary_name: str) -> ProgramInfo:
+    def get_program_info(
+        self, binary_name: str, *, require_analysis: bool = True
+    ) -> ProgramInfo:
+        """Get program info or raise :class:`ProgramAccessError`.
+
+        See :meth:`ghidra_nexus.context.PyGhidraContext.get_program_info`.
+        """
+        from ghidra_nexus.errors import ProgramAccessError, ToolErrorCode
+
         program_info = self._resolve_program_info(binary_name)
 
-        if not program_info.analysis_complete:
-            raise RuntimeError(
-                json.dumps(
-                    {
-                        "message": f"Analysis incomplete for binary '{binary_name}'.",
-                        "binary_name": binary_name,
-                        "ghidra_analysis_complete": program_info.ghidra_analysis_complete,
-                        "code_indexed": program_info.code_collection is not None,
-                        "strings_indexed": program_info.strings is not None,
-                        "suggestion": "Wait and try tool call again.",
-                    }
-                )
+        # Truthy-safe: bare Mock() would look deleted (MagicMock is truthy).
+        if getattr(program_info, "dead", False) is True:
+            raise ProgramAccessError(
+                ToolErrorCode.BINARY_DELETED,
+                f"Binary '{binary_name}' has been deleted and is no longer available.",
+                binary_name=binary_name,
             )
-        self.schedule_indexing(binary_name)
+        if require_analysis and not program_info.analysis_complete:
+            raise ProgramAccessError(
+                ToolErrorCode.BINARY_ANALYZING,
+                (
+                    f"Analysis incomplete for binary '{binary_name}'. "
+                    f"Ghidra: {'complete' if program_info.ghidra_analysis_complete else 'in progress'}; "
+                    f"code_index: {'ready' if program_info.code_collection is not None else 'pending'}; "
+                    f"strings_index: {'ready' if program_info.strings is not None else 'pending'}."
+                ),
+                binary_name=binary_name,
+            )
+        if program_info.analysis_complete:
+            self.schedule_indexing(binary_name)
         return program_info
 
     def _resolve_program_info(self, binary_name: str) -> ProgramInfo:
@@ -559,14 +596,21 @@ class GuiPyGhidraContext(IndexingMixin):
                 try:
                     opened_info = self.open_program_in_gui(binary_name)
                 except ValueError:
-                    raise ValueError(
-                        f"Binary {binary_name} not found. Available binaries: {available_progs}"
+                    from ghidra_nexus.errors import ProgramAccessError, ToolErrorCode
+
+                    raise ProgramAccessError(
+                        ToolErrorCode.BINARY_NOT_FOUND,
+                        f"Binary {binary_name} not found. Available binaries: {available_progs}",
+                        binary_name=binary_name,
                     ) from None
                 program_info = self.programs.get(opened_info["path"])
                 if program_info is None:
-                    raise ValueError(
-                        f"Binary {binary_name} could not be opened. Available binaries: "
-                        f"{available_progs}"
+                    from ghidra_nexus.errors import ProgramAccessError, ToolErrorCode
+
+                    raise ProgramAccessError(
+                        ToolErrorCode.BINARY_NOT_FOUND,
+                        f"Binary {binary_name} could not be opened. Available: {available_progs}",
+                        binary_name=binary_name,
                     )
         return program_info
 
@@ -656,11 +700,20 @@ class GuiPyGhidraContext(IndexingMixin):
         return str(opened["path"])
 
     def import_binary_backgrounded(self, binary_path: str | Path) -> ImportRequestResult:
+        """Spawn a background import; returns task_id + canonical name for polling."""
+        import uuid
+
+        from ghidra_nexus.errors import ProgramAccessError, ToolErrorCode
+
         binary_path = Path(binary_path)
         if not binary_path.exists():
-            raise FileNotFoundError(f"The file {binary_path} cannot be found")
+            raise ProgramAccessError(
+                ToolErrorCode.BINARY_PATH_UNREADABLE,
+                f"The file {binary_path} cannot be found",
+            )
 
         import_plan = build_import_plan([binary_path])
+        task_id = str(uuid.uuid4())
 
         if import_plan.candidates:
             future = self.import_executor.submit(self._import_candidates, import_plan.candidates)
@@ -671,8 +724,21 @@ class GuiPyGhidraContext(IndexingMixin):
             SkippedImportModel(path=str(skipped.path), reason=skipped.reason)
             for skipped in import_plan.skipped
         ]
+
+        from ghidra_nexus.context import PyGhidraContext
+
+        if queued_paths:
+            canonical_name = PyGhidraContext._gen_unique_bin_name(Path(queued_paths[0]))
+        else:
+            canonical_name = ""
+
+        function_count = 0
+        if canonical_name and canonical_name in self.programs:
+            function_count = PyGhidraContext._safe_function_count(self.programs[canonical_name])
+
         message = (
-            f"Queued {len(queued_paths)} import(s) from {binary_path} in the background."
+            f"Queued {len(queued_paths)} import(s) from {binary_path} in the background; "
+            f"poll analysis_status with binary_name={canonical_name!r}."
             if queued_paths
             else f"No importable files were queued from {binary_path}."
         )
@@ -683,6 +749,12 @@ class GuiPyGhidraContext(IndexingMixin):
             skipped_count=len(skipped),
             skipped=skipped,
             message=message,
+            task_id=task_id,
+            binary_name=canonical_name or None,
+            analysis_state="queued" if queued_paths else "failed",
+            function_count=function_count,
+            project_path=str(getattr(self, "project_path", "") or "") or None,
+            nexus_data_dir=str(getattr(self, "nexus_data_dir", "") or "") or None,
         )
 
     def schedule_startup_indexing(self, *, max_binaries: int | None = None) -> None:

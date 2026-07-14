@@ -3,20 +3,32 @@ MCP Tool handlers for ghidra-nexus.
 
 All handlers are async and dispatch Ghidra work through the GhidraExecutor
 background thread for thread safety.
+
+Agent-first error contract (Phase 0.5 / 0.5.1):
+  - Recoverable failures return a ToolError dict body (``ok: false``).
+  - Protocol / programmer bugs still raise McpError.
+  - Never point fallback_tool at a non-existent tool name.
 """
 
 import asyncio
 import functools
 import logging
 import threading
+from pathlib import Path
 from typing import Literal, cast
 
 from mcp.server.fastmcp import Context
 from mcp.shared.exceptions import McpError
-from mcp.types import INTERNAL_ERROR, INVALID_PARAMS, ErrorData
+from mcp.types import INTERNAL_ERROR, ErrorData
 
 from ghidra_nexus.context_protocol import MCPContext
-from ghidra_nexus.errors import ToolErrorCode, make_tool_error
+from ghidra_nexus.errors import (
+    ProgramAccessError,
+    ToolErrorCode,
+    classify_lookup_failure,
+    decompile_failure_result,
+    make_tool_error,
+)
 from ghidra_nexus.ghidra_executor import get_executor
 from ghidra_nexus.models import (
     AnalysisStatusResult,
@@ -37,6 +49,7 @@ from ghidra_nexus.models import (
     ImportRequestResult,
     OpenProgramInfo,
     OpenProgramInfos,
+    ProgramInfo,
     ProgramInfos,
     RenameResponse,
     SaveRequestResult,
@@ -59,15 +72,15 @@ def _require_gui_context(ctx: Context):
 
     pyghidra_context = ctx.request_context.lifespan_context
     if pyghidra_context is None:
-        raise McpError(
-            ErrorData(
-                code=INTERNAL_ERROR,
-                message="Server not initialized. The Ghidra context is not available yet. "
-                "Wait for the server startup to complete.",
-            )
+        raise ProgramAccessError(
+            ToolErrorCode.SERVER_NOT_READY,
+            "Server not initialized. Wait for startup or call wake_ghidra.",
         )
     if not isinstance(pyghidra_context, GuiPyGhidraContext):
-        raise ValueError("This tool requires ghidra-nexus to be running with --gui")
+        raise ProgramAccessError(
+            ToolErrorCode.TOOL_GUI_REQUIRED,
+            "This tool requires ghidra-nexus to be running with --gui",
+        )
     return pyghidra_context
 
 
@@ -94,24 +107,31 @@ def _get_action_name(func_name: str) -> str:
 def _get_context(ctx: Context) -> MCPContext:
     pyghidra_context = ctx.request_context.lifespan_context
     if pyghidra_context is None:
-        raise McpError(
-            ErrorData(
-                code=INTERNAL_ERROR,
-                message="Server not initialized. The Ghidra context is not available. "
-                "Wait for the server startup to complete.",
-            )
+        raise ProgramAccessError(
+            ToolErrorCode.SERVER_NOT_READY,
+            "Server not initialized. The Ghidra context is not available. "
+            "Wait for startup or call wake_ghidra / analysis_status.",
         )
     return pyghidra_context
+
+
+def _require_program(
+    ctx: Context,
+    binary_name: str,
+    *,
+    require_analysis: bool = True,
+):
+    """Resolve a program; returns ProgramInfo or raises ProgramAccessError."""
+    pyghidra_context = _get_context(ctx)
+    return pyghidra_context, pyghidra_context.get_program_info(
+        binary_name, require_analysis=require_analysis
+    )
 
 
 def _error_tool_response(
     code: ToolErrorCode | str, message: str, **kwargs
 ) -> dict:
-    """Build a tool-result dict that conforms to the ToolError schema.
-
-    Tools return this *as their result*, not as a raised framework exception.
-    The agent sees the structured error in the tool-response body.
-    """
+    """Build a tool-result dict that conforms to the ToolError schema."""
     return make_tool_error(code, message, **kwargs)
 
 
@@ -119,9 +139,7 @@ class _ToolRecoverable(Exception):
     """Marker exception: errors that the agent can recover from.
 
     Raise ``_ToolRecoverable(ToolErrorCode.SYMBOL_NOT_FOUND, "...")`` from a tool
-    body; the decorator catches it and returns the structured :class:`ToolError`
-    response (instead of a framework-level McpError). This is the agent-first
-    escape hatch from :mod:`errors`.
+    body; the decorator catches it and returns the structured ToolError response.
     """
 
     def __init__(self, code: ToolErrorCode, message: str, **kwargs):
@@ -130,33 +148,45 @@ class _ToolRecoverable(Exception):
         self.kwargs = kwargs
 
 
+def _as_tool_error_dict(exc: BaseException) -> dict | None:
+    """Convert known recoverable exceptions into a ToolError dict, or None."""
+    if isinstance(exc, ProgramAccessError):
+        return exc.to_tool_error_dict()
+    if isinstance(exc, _ToolRecoverable):
+        return _error_tool_response(exc.code, exc.message, **exc.kwargs)
+    if isinstance(exc, FileNotFoundError):
+        return make_tool_error(
+            ToolErrorCode.BINARY_PATH_UNREADABLE,
+            str(exc) or "File not found",
+        )
+    if isinstance(exc, ValueError):
+        code = classify_lookup_failure(str(exc))
+        if code is ToolErrorCode.UNKNOWN:
+            code = ToolErrorCode.INVALID_PARAMS
+        return make_tool_error(code, str(exc) or "Invalid parameters")
+    return None
+
+
 def mcp_error_handler(func):
-    """Decorator that provides centralized error handling for MCP tools.
+    """Centralized error handling for MCP tools.
 
     Behaviour:
 
-    - Functions that return normally return their value.
-    - ``McpError`` raised → re-raised (framework-level error, agent's invocation
-      was wrong at the protocol level).
-    - ``_ToolRecoverable(code, message, **)`` raised → tool returns the structured
-      ``ToolError`` dict matching the schema. ``code`` is the stable string,
-      ``message`` is human readable. ``binary_name`` / ``addr`` can be passed in
-      ``kwargs``.
-    - Any other ``Exception`` → raised as ``McpError(INTERNAL_ERROR)`` (programmer
-      bug; the watchdog counter ticks once).
+    - Normal return → pass through.
+    - ``ProgramAccessError`` / ``_ToolRecoverable`` / common ValueError /
+      FileNotFoundError → return structured ``ToolError`` dict (agent-first).
+    - ``McpError`` → re-raise (protocol-level).
+    - Other exceptions → ``McpError(INTERNAL_ERROR)`` + watchdog tick.
     """
 
     action = _get_action_name(func.__name__)
 
-    def handle_recoverable(exc: _ToolRecoverable) -> dict:
-        return _error_tool_response(exc.code, exc.message, **exc.kwargs)
-
-    def handle_unexpected(e: Exception):
+    def handle_exception(e: Exception):
         if isinstance(e, McpError):
             return e
-        if isinstance(e, (ValueError, FileNotFoundError, AttributeError)):
-            # Userland validation errors — keep McpError but enrich with hint.
-            return McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
+        tool_err = _as_tool_error_dict(e)
+        if tool_err is not None:
+            return tool_err  # returned as tool result body
         wd = get_watchdog()
         if wd is not None:
             wd.record_error()
@@ -166,23 +196,25 @@ def mcp_error_handler(func):
     async def async_wrapper(*args, **kwargs):
         try:
             return await func(*args, **kwargs)
-        except _ToolRecoverable as e:
-            return handle_recoverable(e)
         except McpError:
             raise
         except Exception as e:
-            raise handle_unexpected(e) from e
+            result = handle_exception(e)
+            if isinstance(result, McpError):
+                raise result from e
+            return result
 
     @functools.wraps(func)
     def sync_wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
-        except _ToolRecoverable as e:
-            return handle_recoverable(e)
         except McpError:
             raise
         except Exception as e:
-            raise handle_unexpected(e) from e
+            result = handle_exception(e)
+            if isinstance(result, McpError):
+                raise result from e
+            return result
 
     return async_wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper
 
@@ -197,8 +229,7 @@ async def decompile_function(
     include_xrefs: bool = False,
     timeout_sec: int = 30,
 ) -> list[DecompiledFunction]:
-    pyghidra_context = _get_context(ctx)
-    program_info = pyghidra_context.get_program_info(binary_name)
+    _, program_info = _require_program(ctx, binary_name, require_analysis=True)
     tools = GhidraTools(program_info)
     targets = [name_or_address] if isinstance(name_or_address, str) else name_or_address
     results: list[DecompiledFunction] = []
@@ -224,7 +255,13 @@ async def decompile_function(
             )
             results.append(result)
         except Exception as e:
-            results.append(DecompiledFunction(name=target, code="", error=str(e)))
+            fields = decompile_failure_result(
+                target,
+                str(e),
+                binary_name=binary_name,
+                addr=target if target.startswith("0x") or target[:1].isdigit() else None,
+            )
+            results.append(DecompiledFunction(**fields))
     return results
 
 
@@ -237,8 +274,7 @@ async def search_symbols_by_name(
     offset: int = 0,
     limit: int = 25,
 ) -> SymbolSearchResults:
-    pyghidra_context = _get_context(ctx)
-    program_info = pyghidra_context.get_program_info(binary_name)
+    _, program_info = _require_program(ctx, binary_name, require_analysis=False)
     tools = GhidraTools(program_info)
 
     def _run():
@@ -266,8 +302,7 @@ async def search_code(
     preview_length: int = 500,
     similarity_threshold: float = 0.0,
 ) -> CodeSearchResults:
-    pyghidra_context = _get_context(ctx)
-    program_info = pyghidra_context.get_program_info(binary_name)
+    _, program_info = _require_program(ctx, binary_name, require_analysis=True)
     tools = GhidraTools(program_info)
 
     def _run():
@@ -296,8 +331,7 @@ async def list_project_binaries(ctx: Context) -> ProgramInfos:
 
 @mcp_error_handler
 async def list_project_binary_metadata(binary_name: str, ctx: Context) -> dict:
-    pyghidra_context = _get_context(ctx)
-    program_info = pyghidra_context.get_program_info(binary_name)
+    _, program_info = _require_program(ctx, binary_name, require_analysis=False)
     return program_info.metadata
 
 
@@ -349,8 +383,7 @@ async def rename_function(
     new_name: str,
     ctx: Context,
 ) -> RenameResponse:
-    pyghidra_context = _get_context(ctx)
-    program_info = pyghidra_context.get_program_info(binary_name)
+    pyghidra_context, program_info = _require_program(ctx, binary_name, require_analysis=True)
     tools = GhidraTools(program_info)
 
     def _run():
@@ -374,8 +407,7 @@ async def rename_variable(
     new_name: str,
     ctx: Context,
 ) -> VariableRenameResponse:
-    pyghidra_context = _get_context(ctx)
-    program_info = pyghidra_context.get_program_info(binary_name)
+    pyghidra_context, program_info = _require_program(ctx, binary_name, require_analysis=True)
     tools = GhidraTools(program_info)
 
     def _run():
@@ -400,8 +432,7 @@ async def set_variable_type(
     type_name: str,
     ctx: Context,
 ) -> VariableTypeResponse:
-    pyghidra_context = _get_context(ctx)
-    program_info = pyghidra_context.get_program_info(binary_name)
+    pyghidra_context, program_info = _require_program(ctx, binary_name, require_analysis=True)
     tools = GhidraTools(program_info)
 
     def _run():
@@ -425,8 +456,7 @@ async def set_function_prototype(
     prototype: str,
     ctx: Context,
 ) -> FunctionPrototypeResponse:
-    pyghidra_context = _get_context(ctx)
-    program_info = pyghidra_context.get_program_info(binary_name)
+    pyghidra_context, program_info = _require_program(ctx, binary_name, require_analysis=True)
     tools = GhidraTools(program_info)
 
     def _run():
@@ -451,8 +481,7 @@ async def set_comment(
     comment_type: Literal["decompiler", "plate", "pre", "eol", "post", "repeatable"],
     ctx: Context,
 ) -> CommentResponse:
-    pyghidra_context = _get_context(ctx)
-    program_info = pyghidra_context.get_program_info(binary_name)
+    pyghidra_context, program_info = _require_program(ctx, binary_name, require_analysis=True)
     tools = GhidraTools(program_info)
 
     def _run():
@@ -474,13 +503,11 @@ async def delete_project_binary(binary_name: str, ctx: Context) -> str:
     pyghidra_context = _get_context(ctx)
     if pyghidra_context.delete_program(binary_name):
         return f"Successfully deleted binary: {binary_name}"
-    else:
-        raise McpError(
-            ErrorData(
-                code=INVALID_PARAMS,
-                message=f"Binary '{binary_name}' not found or could not be deleted.",
-            )
-        )
+    raise _ToolRecoverable(
+        ToolErrorCode.BINARY_NOT_FOUND,
+        f"Binary '{binary_name}' not found or could not be deleted.",
+        binary_name=binary_name,
+    )
 
 
 @mcp_error_handler
@@ -491,8 +518,7 @@ async def list_exports(
     offset: int = 0,
     limit: int = 25,
 ) -> ExportInfos:
-    pyghidra_context = _get_context(ctx)
-    program_info = pyghidra_context.get_program_info(binary_name)
+    _, program_info = _require_program(ctx, binary_name, require_analysis=False)
     tools = GhidraTools(program_info)
 
     def _run():
@@ -512,8 +538,7 @@ async def list_imports(
     offset: int = 0,
     limit: int = 25,
 ) -> ImportInfos:
-    pyghidra_context = _get_context(ctx)
-    program_info = pyghidra_context.get_program_info(binary_name)
+    _, program_info = _require_program(ctx, binary_name, require_analysis=False)
     tools = GhidraTools(program_info)
 
     def _run():
@@ -529,8 +554,7 @@ async def list_imports(
 async def list_xrefs(
     binary_name: str, name_or_address: str | list[str], ctx: Context
 ) -> list[CrossReferenceInfos]:
-    pyghidra_context = _get_context(ctx)
-    program_info = pyghidra_context.get_program_info(binary_name)
+    _, program_info = _require_program(ctx, binary_name, require_analysis=True)
     tools = GhidraTools(program_info)
     targets = [name_or_address] if isinstance(name_or_address, str) else name_or_address
 
@@ -547,7 +571,17 @@ async def list_xrefs(
             )
             results.append(result)
         except Exception as e:
-            results.append(CrossReferenceInfos(target=target, cross_references=[], error=str(e)))
+            code = classify_lookup_failure(str(e), binary_name=binary_name)
+            err = make_tool_error(code, str(e), binary_name=binary_name, addr=target)
+            results.append(
+                CrossReferenceInfos(
+                    target=target,
+                    cross_references=[],
+                    error=str(e),
+                    error_code=err["error_code"],
+                    hint=err.get("hint"),
+                )
+            )
     return results
 
 
@@ -558,8 +592,7 @@ async def search_strings(
     query: str,
     limit: int = 100,
 ) -> StringSearchResults:
-    pyghidra_context = _get_context(ctx)
-    program_info = pyghidra_context.get_program_info(binary_name)
+    _, program_info = _require_program(ctx, binary_name, require_analysis=False)
     tools = GhidraTools(program_info)
 
     def _run():
@@ -574,8 +607,7 @@ async def search_strings(
 async def read_bytes(
     binary_name: str, ctx: Context, address: str, size: int = 32
 ) -> BytesReadResult:
-    pyghidra_context = _get_context(ctx)
-    program_info = pyghidra_context.get_program_info(binary_name)
+    _, program_info = _require_program(ctx, binary_name, require_analysis=False)
     tools = GhidraTools(program_info)
 
     def _run():
@@ -595,11 +627,20 @@ async def disassemble(
     include_bytes: bool = False,
 ) -> DisassembleResult:
     if count <= 0:
-        raise ValueError("count must be > 0")
+        raise _ToolRecoverable(
+            ToolErrorCode.INVALID_RANGE,
+            "count must be > 0",
+            binary_name=binary_name,
+            addr=address,
+        )
     if count > 200:
-        raise ValueError("count must be <= 200")
-    pyghidra_context = _get_context(ctx)
-    program_info = pyghidra_context.get_program_info(binary_name)
+        raise _ToolRecoverable(
+            ToolErrorCode.INVALID_RANGE,
+            "count must be <= 200",
+            binary_name=binary_name,
+            addr=address,
+        )
+    _, program_info = _require_program(ctx, binary_name, require_analysis=False)
     tools = GhidraTools(program_info)
 
     def _run():
@@ -622,8 +663,7 @@ async def gen_callgraph(
     bottom_layers: int = 3,
     max_run_time: int = 120,
 ) -> CallGraphResult:
-    pyghidra_context = _get_context(ctx)
-    program_info = pyghidra_context.get_program_info(binary_name)
+    _, program_info = _require_program(ctx, binary_name, require_analysis=True)
     tools = GhidraTools(program_info)
 
     def _run():
@@ -657,73 +697,117 @@ async def analysis_status(ctx: Context) -> AnalysisStatusResult:
           complete / failed)
         - ``function_count`` — live count from Ghidra; ``0`` means not analyzed yet
         - ``entropy_summary`` — top-level entropy profile (encrypted / compressed /
-          normal / mixed)
+          normal / mixed / unknown)
         - ``project_path`` / ``nexus_data_dir`` / ``idb_path`` — absolute paths
           the agent can validate against ``os.path.exists``
         - ``recommended_tools`` — what to call next given current state
 
     Server-level:
         - ``path_warnings`` — writability warnings about the project path. Empty
-          on a healthy setup; contains surface warnings about UAC-locked
-          directories on Windows before IDB writes silently fail.
+          on a healthy setup; surfaces UAC-locked directories on Windows before
+          project writes silently fail.
     """
     from ghidra_nexus import __version__
+    from ghidra_nexus.context import PyGhidraContext
     from ghidra_nexus.server import _check_project_path_writable
 
     pyghidra_context = _get_context(ctx)
-
-    # Snapshot the raw models from the context.
     raw_infos = pyghidra_context.list_project_binary_infos()
 
-    # Normalize into the new ProgramInfo shape.
-    binaries: list = []
+    project_path_str = str(getattr(pyghidra_context, "project_path", None) or "") or None
+    nexus_dir_str = str(getattr(pyghidra_context, "nexus_data_dir", None) or "") or None
+
+    binaries: list[ProgramInfo] = []
     for raw in raw_infos:
-        # Translate internal state to the agent-facing string.
+        # Prefer fields already enriched by list_project_binary_infos.
+        function_count = int(getattr(raw, "function_count", 0) or 0)
+        sha256 = getattr(raw, "sha256", None)
+        entropy_summary = getattr(raw, "entropy_summary", None) or "unknown"
+        if isinstance(raw.metadata, dict):
+            if not function_count:
+                function_count = int(raw.metadata.get("function_count") or 0)
+            if not sha256:
+                sha256 = raw.metadata.get("sha256")
+            if entropy_summary in (None, "unknown", "normal") and raw.metadata.get(
+                "entropy_summary"
+            ):
+                entropy_summary = raw.metadata["entropy_summary"]
+
+        # Live re-count from the open program when possible (truthful status).
+        live_pi = None
+        try:
+            with getattr(pyghidra_context, "_programs_lock", threading.Lock()):
+                programs = getattr(pyghidra_context, "programs", {}) or {}
+                live_pi = programs.get(raw.name)
+        except Exception:
+            live_pi = None
+
+        if live_pi is not None:
+            try:
+                function_count = PyGhidraContext._safe_function_count(live_pi)
+            except Exception:
+                pass
+            try:
+                sha256 = PyGhidraContext._safe_sha256(live_pi) or sha256
+            except Exception:
+                pass
+            # Cheap cached entropy pass (once per binary per daemon lifetime).
+            ensure = getattr(pyghidra_context, "ensure_entropy_summary", None)
+            if callable(ensure):
+                try:
+                    entropy_summary = ensure(live_pi)
+                except Exception:
+                    pass
+            elif getattr(live_pi, "entropy_summary", None):
+                entropy_summary = live_pi.entropy_summary
+
         if raw.analysis_complete:
             state = "complete"
+            if function_count == 0:
+                # Analysis finished but no functions — agent should not treat as
+                # a healthy binary (packed / empty / wrong loader).
+                recommended = ["section_health", "survey_binary_fast"]
+            elif getattr(raw, "code_indexed", False):
+                recommended = ["survey_binary_full", "search_code"]
+            else:
+                recommended = ["section_health", "survey_binary_full"]
         else:
-            state = "analyzing_functions"
+            state = getattr(raw, "analysis_state", None) or "analyzing_functions"
+            recommended = ["survey_binary_fast", "section_health", "analysis_status"]
 
-        recommended: list[str] = []
-        if not raw.analysis_complete:
-            recommended = ["survey_binary_fast", "analysis_status"]
-        elif getattr(raw, "code_indexed", False):
-            recommended = ["survey_binary_full", "search_code"]
-        else:
-            recommended = ["survey_binary_full", "section_health"]
+        file_path = raw.file_path
+        path_exists: bool | None = None
+        if file_path:
+            try:
+                path_exists = Path(file_path).exists()
+            except Exception:
+                path_exists = None
 
         binaries.append(
             ProgramInfo(
                 name=raw.name,
-                file_path=raw.file_path,
+                file_path=file_path,
                 load_time=raw.load_time,
                 analysis_complete=raw.analysis_complete,
-                metadata=raw.metadata,
+                metadata=raw.metadata if isinstance(raw.metadata, dict) else {},
                 code_indexed=raw.code_indexed,
                 strings_indexed=raw.strings_indexed,
                 analysis_state=state,
-                function_count=len(getattr(raw.metadata, "function_count", 0) or 0)
-                if isinstance(raw.metadata, dict)
-                else 0,
-                sha256=(raw.metadata or {}).get("sha256") if isinstance(raw.metadata, dict) else None,
-                entropy_summary=(raw.metadata or {}).get("entropy_summary", "normal")
-                if isinstance(raw.metadata, dict)
-                else "normal",
-                project_path=str(getattr(pyghidra_context, "project_path", None) or "")
-                or None,
-                nexus_data_dir=str(getattr(pyghidra_context, "nexus_data_dir", None) or "")
-                or None,
-                idb_path=str(getattr(raw, "file_path", None) or "") or None,
+                function_count=function_count,
+                sha256=sha256,
+                entropy_summary=entropy_summary or "unknown",
+                project_path=project_path_str,
+                nexus_data_dir=nexus_dir_str,
+                idb_path=file_path,
+                path_exists=path_exists,
                 recommended_tools=recommended,
             )
         )
 
-    # Server-level path warnings.
-    project_path = getattr(pyghidra_context, "project_path", None)
-    warnings = []
+    warnings: list[str] = []
     try:
-        if project_path is not None:
-            warnings = _check_project_path_writable(Path(str(project_path)))
+        if project_path_str is not None:
+            warnings = _check_project_path_writable(Path(project_path_str))
     except Exception:
         warnings = []
 
@@ -795,8 +879,7 @@ async def survey_binary_fast(
     state the program is in, including a freshly imported binary that
     hasn't been analyzed yet.
     """
-    pyghidra_context = _get_context(ctx)
-    program_info = pyghidra_context.get_program_info(binary_name)
+    _, program_info = _require_program(ctx, binary_name, require_analysis=False)
     tools = GhidraTools(program_info)
 
     def _run():
@@ -856,22 +939,9 @@ async def survey_binary_full(
         - ``call_graph_summary`` → ``gen_callgraph(binary_name, "entry",
           direction="called")`` for the topology.
     """
-    pyghidra_context = _get_context(ctx)
-    program_info = pyghidra_context.get_program_info(binary_name)
+    # require_analysis=True → structured BINARY_ANALYZING if still running.
+    _, program_info = _require_program(ctx, binary_name, require_analysis=True)
     tools = GhidraTools(program_info)
-
-    if not program_info.analysis_complete:
-        raise McpError(
-            ErrorData(
-                code=INVALID_PARAMS,
-                message=(
-                    f"Ghidra analysis for '{binary_name}' is still in progress. "
-                    "Call survey_binary_fast for a pre-analysis snapshot, or "
-                    "wait for analysis_status to report complete and then "
-                    "retry survey_binary_full."
-                ),
-            )
-        )
 
     def _run():
         return tools.survey_binary_full(detail_level=detail_level)
@@ -901,15 +971,23 @@ async def section_health(binary_name: str, ctx: Context) -> list[SectionHealth]:
     For modern protected binaries where the `.text` is high-entropy, expect
     one row per section with ``classification: encrypted`` and
     ``recommendation: dump_runtime``. The agent's path then becomes
-    ``list_functions`` + ``lief_strings`` + cross-DLL static analysis,
-    not decompile.
+    static triage (imports / strings / sibling DLLs), not blind decompile.
     """
-    pyghidra_context = _get_context(ctx)
-    program_info = pyghidra_context.get_program_info(binary_name)
+    _, program_info = _require_program(ctx, binary_name, require_analysis=False)
     tools = GhidraTools(program_info)
 
     def _run():
-        return tools.section_health()
+        result = tools.section_health()
+        # Cache entropy summary for analysis_status.
+        try:
+            from ghidra_nexus.section_entropy import summarize_section_classifications
+
+            summary = summarize_section_classifications(r.classification for r in result)
+            program_info.entropy_summary = summary
+            program_info.entropy_computed = True
+        except Exception:
+            pass
+        return result
 
     return await get_executor().submit(
         program_info, _run, task_id=f"section_health:{binary_name}"

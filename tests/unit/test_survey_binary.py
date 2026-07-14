@@ -134,23 +134,40 @@ def test_survey_full_handler_validates_payload_with_pydantic(monkeypatch):
 
 
 def test_survey_full_refuses_when_analysis_incomplete():
-    """Refuse to run survey_binary_full while Ghidra is still analyzing."""
-    pi = _make_program_info(analysis_complete=False)
+    """Refuse to run survey_binary_full while Ghidra is still analyzing.
+
+    Phase 0.5.1: returns structured ToolError body (ok:false), not McpError.
+    """
+    from ghidra_nexus.errors import ProgramAccessError, ToolErrorCode
+
     pyghidra_context = Mock()
-    pyghidra_context.get_program_info.return_value = pi
+
+    def _get_program_info(name, *, require_analysis=True):
+        if require_analysis:
+            raise ProgramAccessError(
+                ToolErrorCode.BINARY_ANALYZING,
+                f"Analysis incomplete for binary '{name}'.",
+                binary_name=name,
+            )
+        return _make_program_info(analysis_complete=False)
+
+    pyghidra_context.get_program_info.side_effect = _get_program_info
 
     ctx = Mock()
     ctx.request_context.lifespan_context = pyghidra_context
 
-    with pytest.raises(McpError) as excinfo:
-        asyncio.run(
-            mcp_tools.survey_binary_full(
-                binary_name="sample", ctx=ctx, detail_level="standard"
-            )
+    result = asyncio.run(
+        mcp_tools.survey_binary_full(
+            binary_name="sample", ctx=ctx, detail_level="standard"
         )
+    )
 
-    msg = str(excinfo.value)
-    assert "survey_binary_fast" in msg or "analysis_status" in msg
+    assert isinstance(result, dict)
+    assert result.get("ok") is False
+    assert result.get("error_code") == "binary_analyzing"
+    assert result.get("fallback_tool") == "analysis_status"
+    hint = result.get("hint") or ""
+    assert "survey_binary_fast" in hint or "analysis_status" in hint
 
 
 def test_survey_full_forwards_minimal_detail_level(monkeypatch):

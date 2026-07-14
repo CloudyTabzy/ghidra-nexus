@@ -82,10 +82,14 @@ class ProgramInfo(BaseModel):
     analysis_state: str = "complete"  # AnalysisState value
     function_count: int = 0
     sha256: str | None = None
-    entropy_summary: str = "normal"   # EntropySummary value
+    entropy_summary: str = "unknown"  # EntropySummary value or "unknown"
     project_path: str | None = None
     nexus_data_dir: str | None = None
     idb_path: str | None = None
+    path_exists: bool | None = Field(
+        None,
+        description="True when file_path / idb_path was checked and exists on disk.",
+    )
     recommended_tools: list[str] = Field(
         default_factory=list,
         description=(
@@ -185,11 +189,11 @@ class SectionRecommendation(str, Enum):
 
 
 def classify_entropy(entropy: float, size_bytes: int) -> SectionClassification:
-    """Map a Shannon-entropy value (bits/byte) + section size to a classification.
+    """Map Shannon entropy + size to a classification (no permission info).
 
-    Pure function so it can be unit-tested without a Ghidra program. Thresholds
-    match the IDA-side feedback heuristic with a small safety margin for
-    short sections where entropy estimation is noisy.
+    Prefer :func:`ghidra_nexus.section_entropy.classify_section` when executability
+    is known — that path also returns recommendation + reason. This helper remains
+    for lightweight call sites that only need the class label.
     """
     if size_bytes < 16:
         return SectionClassification.UNKNOWN
@@ -197,13 +201,11 @@ def classify_entropy(entropy: float, size_bytes: int) -> SectionClassification:
         return SectionClassification.ENCRYPTED
     if entropy >= 5.5:
         return SectionClassification.COMPRESSED
-    # Differentiate code vs data by proxy: anything executable with low entropy
-    # reads as code; non-executable low-entropy reads as data. Permission check
-    # is the caller's job (we don't have it here).
     return SectionClassification.CODE
 
 
 def recommendation_for(classification: SectionClassification) -> SectionRecommendation:
+    """Map classification → recommendation. Prefer ``section_entropy.classify_section``."""
     if classification == SectionClassification.ENCRYPTED:
         return SectionRecommendation.DUMP_RUNTIME
     if classification == SectionClassification.COMPRESSED:
@@ -341,6 +343,9 @@ class CrossReferenceInfos(BaseModel):
     target: str | None = None
     cross_references: list[CrossReferenceInfo]
     error: str | None = None
+    # Phase 0.5.1: typed failure fields (parallel to DecompiledFunction).
+    error_code: str | None = None
+    hint: str | None = None
 
 
 # Resolve forward reference for DecompiledFunction.xrefs

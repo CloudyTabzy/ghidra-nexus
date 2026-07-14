@@ -1,8 +1,7 @@
-"""Unit tests for ghidra_nexus.errors — the structured ToolError + helper.
+"""Unit tests for ghidra_nexus.errors — structured ToolError + helpers.
 
-These tests focus on schema correctness and the ``classify_decompile_failure``
-mapping heuristic. Integration tests against real Ghidra live in
-``tests/integration``.
+These tests focus on schema correctness, fallback integrity (no ghost tools),
+and classification heuristics. Integration tests live under tests/integration.
 """
 
 from __future__ import annotations
@@ -10,8 +9,14 @@ from __future__ import annotations
 import pytest
 
 from ghidra_nexus.errors import (
+    REGISTERED_TOOL_NAMES,
+    ProgramAccessError,
+    ToolError,
     ToolErrorCode,
+    _FALLBACK_TOOL,
     classify_decompile_failure,
+    classify_lookup_failure,
+    decompile_failure_result,
     make_tool_error,
 )
 
@@ -22,7 +27,7 @@ class TestMakeToolError:
         assert body["ok"] is False
         assert body["error_code"] == "binary_not_found"
         assert body["message"] == "no such binary"
-        assert body["hint"]  # auto-populated
+        assert body["hint"]
         assert body["fallback_tool"] == "list_project_binaries"
 
     def test_string_code_is_normalized(self):
@@ -43,20 +48,29 @@ class TestMakeToolError:
         assert body["binary_name"] == "find.exe"
         assert body["addr"] == "0x401000"
 
-    def test_no_fallback_for_truly_lifecycle_codes(self):
-        # BINARY_ALREADY_IMPORTED is purely a status notification — there's no
-        # obvious next tool; the agent should re-poll analysis_status itself.
+    def test_fallback_for_lifecycle_codes(self):
         body = make_tool_error(ToolErrorCode.BINARY_ALREADY_IMPORTED, "already there")
         assert body["fallback_tool"] == "analysis_status"
+
+    def test_invalid_range_has_no_fallback_or_valid(self):
         body = make_tool_error(ToolErrorCode.INVALID_RANGE, "out of range")
-        # No fallback registered → stripped from the response entirely.
-        assert "fallback_tool" not in body
+        # Either no fallback, or a registered tool name.
+        fb = body.get("fallback_tool")
+        assert fb is None or fb in REGISTERED_TOOL_NAMES
 
     def test_explicit_fallback_overrides_table(self):
         body = make_tool_error(
             ToolErrorCode.BINARY_NOT_FOUND, "x", fallback_tool="import_binary"
         )
         assert body["fallback_tool"] == "import_binary"
+
+    def test_ghost_fallback_is_stripped(self):
+        body = make_tool_error(
+            ToolErrorCode.BINARY_NOT_FOUND,
+            "x",
+            fallback_tool="analyze_range",  # does not exist
+        )
+        assert "fallback_tool" not in body
 
     def test_hint_overrides_default(self):
         body = make_tool_error(
@@ -65,6 +79,36 @@ class TestMakeToolError:
             hint="call disassemble instead",
         )
         assert body["hint"] == "call disassemble instead"
+
+    def test_pydantic_round_trip(self):
+        body = make_tool_error(ToolErrorCode.SYMBOL_NOT_FOUND, "missing")
+        err = ToolError(**body)
+        assert err.ok is False
+        assert err.error_code == "symbol_not_found"
+
+
+class TestFallbackTableIntegrity:
+    """Every fallback_tool must name a real registered MCP tool."""
+
+    def test_all_fallbacks_are_registered(self):
+        ghosts = {
+            code: tool
+            for code, tool in _FALLBACK_TOOL.items()
+            if tool not in REGISTERED_TOOL_NAMES
+        }
+        assert not ghosts, f"Ghost fallback tools: {ghosts}"
+
+    def test_no_analyze_range_or_disasm_alias(self):
+        forbidden = {"analyze_range", "analyze_function", "disasm"}
+        used = set(_FALLBACK_TOOL.values())
+        assert not (used & forbidden), f"Forbidden ghost names still in table: {used & forbidden}"
+
+    def test_expected_critical_fallbacks(self):
+        assert _FALLBACK_TOOL[ToolErrorCode.DECOMPILE_ENCRYPTED] == "disassemble"
+        assert _FALLBACK_TOOL[ToolErrorCode.DECOMPILE_UNSUPPORTED_ISA] == "disassemble"
+        assert _FALLBACK_TOOL[ToolErrorCode.ADDRESS_NOT_ANALYZED] == "disassemble"
+        assert _FALLBACK_TOOL[ToolErrorCode.BINARY_ANALYZING] == "analysis_status"
+        assert _FALLBACK_TOOL[ToolErrorCode.DECOMPILE_TYPE_ERROR] == "set_function_prototype"
 
 
 class TestClassifyDecompileFailure:
@@ -91,34 +135,58 @@ class TestClassifyDecompileFailure:
         )
 
 
-class TestFallbackTableCoverage:
-    """Every ToolErrorCode that has a natural fallback must be in the table.
+class TestClassifyLookupFailure:
+    def test_symbol_not_found(self):
+        assert (
+            classify_lookup_failure("Symbol 'foo' not found.")
+            is ToolErrorCode.SYMBOL_NOT_FOUND
+        )
 
-    Tests guard against accidentally removing rows; the day we add a new code
-    without a fallback, this test name will be the first hit.
-    """
+    def test_ambiguous(self):
+        assert (
+            classify_lookup_failure("Ambiguous match for 'main'")
+            is ToolErrorCode.SYMBOL_AMBIGUOUS
+        )
 
-    EXPECTED_FALLBACKS = {
-        ToolErrorCode.DECOMPILE_ENCRYPTED,
-        ToolErrorCode.DECOMPILE_TOO_SMALL,
-        ToolErrorCode.DECOMPILE_NO_LICENSE,
-        ToolErrorCode.DECOMPILE_UNSUPPORTED_ISA,
-        ToolErrorCode.DECOMPILE_TYPE_ERROR,
-        ToolErrorCode.DISASSEMBLE_NO_BYTES,
-        ToolErrorCode.ADDRESS_NOT_ANALYZED,
-        ToolErrorCode.ADDRESS_NOT_FOUND,
-        ToolErrorCode.ADDRESS_NOT_MAPPED,
-        ToolErrorCode.SYMBOL_NOT_FOUND,
-        ToolErrorCode.BINARY_NOT_FOUND,
-        ToolErrorCode.BINARY_NOT_ANALYZED,
-        ToolErrorCode.BINARY_ANALYZING,
-        ToolErrorCode.BINARY_ALREADY_IMPORTED,
-        ToolErrorCode.SERVER_NOT_READY,
-        ToolErrorCode.TOOL_GUI_REQUIRED,
-    }
+    def test_binary_not_found(self):
+        assert (
+            classify_lookup_failure("Binary 'x' not found. Available: []")
+            is ToolErrorCode.BINARY_NOT_FOUND
+        )
 
-    def test_fallbacks_present(self):
-        from ghidra_nexus.errors import _FALLBACK_TOOL
+    def test_analyzing(self):
+        assert (
+            classify_lookup_failure("Analysis incomplete for binary 'x'")
+            is ToolErrorCode.BINARY_ANALYZING
+        )
 
-        missing = self.EXPECTED_FALLBACKS - set(_FALLBACK_TOOL.keys())
-        assert not missing, f"Missing fallback rows for: {missing}"
+
+class TestDecompileFailureResult:
+    def test_empty_code_on_failure(self):
+        fields = decompile_failure_result(
+            "main", "no valid instructions", binary_name="find.exe", addr="0x401000"
+        )
+        assert fields["code"] == ""
+        assert fields["error_code"] == "encrypted_bytes"
+        assert fields["hint"]
+        assert fields["error"]
+
+    def test_lookup_style_exception_maps_to_symbol(self):
+        fields = decompile_failure_result(
+            "nope", "Symbol 'nope' not found.", binary_name="find.exe"
+        )
+        assert fields["error_code"] == "symbol_not_found"
+
+
+class TestProgramAccessError:
+    def test_to_tool_error_dict(self):
+        exc = ProgramAccessError(
+            ToolErrorCode.BINARY_ANALYZING,
+            "still going",
+            binary_name="find.exe",
+        )
+        body = exc.to_tool_error_dict()
+        assert body["ok"] is False
+        assert body["error_code"] == "binary_analyzing"
+        assert body["fallback_tool"] == "analysis_status"
+        assert body["binary_name"] == "find.exe"

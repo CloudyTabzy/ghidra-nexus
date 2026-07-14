@@ -71,13 +71,79 @@ uv run ghidra-nexus
 | Group | Examples |
 |-------|----------|
 | **Lifecycle** | `import_binary`, `delete_project_binary`, `analysis_status`, `save` |
-| **Triage** | `survey_binary` (single-call snapshot of metadata, interesting functions / strings / imports / call graph) |
-| **Read** | `decompile_function`, `disassemble`, `list_functions`, `list_imports`, `list_exports`, `search_strings`, `list_xrefs`, `gen_callgraph`, `read_bytes` |
+| **Triage** | `survey_binary_fast` / `survey_binary_full`, `section_health` |
+| **Read** | `decompile_function`, `disassemble`, `list_imports`, `list_exports`, `search_strings`, `list_xrefs`, `gen_callgraph`, `read_bytes` |
 | **Search** | `search_symbols_by_name`, `search_code` (semantic via ChromaDB) |
 | **Write** | `rename_function`, `rename_variable`, `set_variable_type`, `set_function_prototype`, `set_comment` |
 | **Lazy** | `wake_ghidra`, `ghidra_status` (HTTP transport only — boots JVM on first call) |
 
-A complete list lands in `Implementations/phase-3-agent-api.md`.
+---
+
+## Agent onboarding workflow
+
+```
+1. import_binary(path)                 ← returns task_id + binary_name (queued)
+2. analysis_status()                   ← poll until analysis_complete=true
+3. section_health(binary_name)         ← catch encrypted / packed sections first
+4. survey_binary_full(binary_name)     ← or survey_binary_fast while waiting
+5. decompile_function / list_xrefs …   ← deep work
+```
+
+`import_binary` never claims analysis finished. It returns:
+
+- `task_id` — correlator for this import
+- `binary_name` — canonical name for every subsequent call
+- `analysis_state` — `queued` | `loading` | `analyzing_functions` | `complete` | `failed`
+- `function_count` — live count (0 until Ghidra finds functions)
+- `project_path` / `nexus_data_dir` / `idb_path` — absolute paths to validate
+
+`analysis_status` is the source of truth: live `function_count`, `sha256`,
+`entropy_summary`, `path_warnings` (UAC-locked project paths), and
+`recommended_tools` for the next call.
+
+### `section_health`
+
+Per-section Shannon entropy + classification:
+
+| classification | entropy | recommendation |
+|----------------|---------|----------------|
+| `encrypted` | ≥ 7.0 | `dump_runtime` |
+| `compressed` | 5.5–7.0 | `decompress` |
+| `code` | low, executable | `analyze` |
+| `data` | low, non-exec | `skip` |
+
+Call this **before** a decompile storm on modern protected binaries.
+
+---
+
+## Agent-first error semantics
+
+Recoverable tool failures return a **structured body** (not a framework re-raise):
+
+```json
+{
+  "ok": false,
+  "error_code": "encrypted_bytes",
+  "message": "Decompilation produced no usable output",
+  "hint": "Call disassemble(addr) for raw instructions, or section_health to confirm encryption.",
+  "fallback_tool": "disassemble",
+  "binary_name": "find.exe",
+  "addr": "0x401000"
+}
+```
+
+Invariants:
+
+1. `error_code` is a stable string the agent can branch on.
+2. `hint` is always present (one-sentence next step).
+3. `fallback_tool` always names a **real registered tool** (never a ghost).
+4. Decompile failures also set `error_code` / `hint` on each `DecompiledFunction`
+   entry; `code` is empty on failure so agents do not treat error text as pseudo-C.
+
+Tools that work **during** analysis (no hard block): `survey_binary_fast`,
+`section_health`, `read_bytes`, `disassemble`, `list_exports`, `list_imports`,
+`search_symbols_by_name`, `search_strings`. Deep tools (`decompile_function`,
+`survey_binary_full`, renames) return `binary_analyzing` until analysis completes.
 
 ---
 

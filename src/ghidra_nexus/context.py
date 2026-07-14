@@ -47,6 +47,10 @@ class ProgramInfo:
     strings: list | None = None
     rw_lock: threading.RLock = field(default_factory=threading.RLock)
     dead: bool = False
+    # Cached agent-facing triage fields (filled on demand / after analysis).
+    entropy_summary: str = "unknown"
+    entropy_computed: bool = False
+    cached_sha256: str | None = None
 
     @property
     def analysis_complete(self) -> bool:
@@ -267,20 +271,39 @@ class PyGhidraContext(IndexingMixin):
             return list(self.programs.values())
 
     def list_project_binary_infos(self) -> list[ProgramInfoModel]:
-        """Return MCP response models for project binaries."""
+        """Return MCP response models for project binaries.
+
+        Enriches each entry with live ``function_count``, ``sha256``, and
+        ``entropy_summary`` so ``analysis_status`` never lies to the agent.
+        """
         program_infos = []
         with self._programs_lock:
             items = list(self.programs.items())
         for name, pi in items:
+            meta = dict(pi.metadata or {})
+            function_count = self._safe_function_count(pi)
+            sha256 = self._safe_sha256(pi)
+            if sha256:
+                meta["sha256"] = sha256
+            meta["function_count"] = function_count
+            meta["entropy_summary"] = getattr(pi, "entropy_summary", "unknown") or "unknown"
+            file_path = str(pi.file_path) if pi.file_path else None
             program_infos.append(
                 ProgramInfoModel(
                     name=name,
-                    file_path=str(pi.file_path) if pi.file_path else None,
+                    file_path=file_path,
                     load_time=pi.load_time,
                     analysis_complete=pi.analysis_complete,
-                    metadata={},
+                    metadata=meta,
                     code_indexed=pi.code_collection is not None,
                     strings_indexed=pi.strings is not None,
+                    analysis_state=(
+                        "complete" if pi.analysis_complete else "analyzing_functions"
+                    ),
+                    function_count=function_count,
+                    sha256=sha256,
+                    entropy_summary=meta["entropy_summary"],
+                    idb_path=file_path,
                 )
             )
         return program_infos
@@ -321,8 +344,12 @@ class PyGhidraContext(IndexingMixin):
         if not program_info:
             with self._programs_lock:
                 available_progs = list(self.programs.keys())
-            raise ValueError(
-                f"Binary {program_name} not found. Available binaries: {available_progs}"
+            from ghidra_nexus.errors import ProgramAccessError, ToolErrorCode
+
+            raise ProgramAccessError(
+                ToolErrorCode.BINARY_NOT_FOUND,
+                f"Binary {program_name} not found. Available binaries: {available_progs}",
+                binary_name=program_name,
             )
         program_info.dead = True
         logger.info(f"Deleting program: {program_name}")
@@ -505,9 +532,19 @@ class PyGhidraContext(IndexingMixin):
         """
         import uuid
 
+        from ghidra_nexus.errors import ProgramAccessError, ToolErrorCode
+
         binary_path = Path(binary_path)
         if not binary_path.exists():
-            raise FileNotFoundError(f"The file {binary_path} cannot be found")
+            raise ProgramAccessError(
+                ToolErrorCode.BINARY_PATH_UNREADABLE,
+                f"The file {binary_path} cannot be found",
+            )
+        if not binary_path.is_file() and not binary_path.is_dir():
+            raise ProgramAccessError(
+                ToolErrorCode.BINARY_PATH_UNREADABLE,
+                f"The path {binary_path} is not a readable file or directory",
+            )
 
         import_plan = build_import_plan([binary_path])
 
@@ -586,9 +623,7 @@ class PyGhidraContext(IndexingMixin):
     def _safe_function_count(program_info) -> int:
         """Best-effort function count; returns 0 on any error."""
         try:
-            from ghidra.program.model.listing import Program
-
-            program: Program = program_info.program
+            program = program_info.program
             if program is None:
                 return 0
             fm = program.getFunctionManager()
@@ -596,28 +631,136 @@ class PyGhidraContext(IndexingMixin):
         except Exception:
             return 0
 
-    def get_program_info(self, binary_name: str) -> "ProgramInfo":
-        """Get program info or raise ValueError if not found."""
+    @staticmethod
+    def _safe_sha256(program_info) -> str | None:
+        """Best-effort sha256 of the on-disk binary (or cached value)."""
+        cached = getattr(program_info, "cached_sha256", None)
+        if cached:
+            return cached
+        try:
+            path = program_info.file_path
+            if path is None:
+                # Fall back to Ghidra metadata keys when present.
+                meta = program_info.metadata or {}
+                for key in ("Executable SHA-256", "SHA-256", "sha256"):
+                    if meta.get(key):
+                        program_info.cached_sha256 = str(meta[key])
+                        return program_info.cached_sha256
+                return None
+            p = Path(path)
+            if not p.is_file():
+                return None
+            h = hashlib.sha256()
+            with p.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    h.update(chunk)
+            digest = h.hexdigest()
+            program_info.cached_sha256 = digest
+            return digest
+        except Exception:
+            return None
+
+    def ensure_entropy_summary(self, program_info: "ProgramInfo") -> str:
+        """Compute and cache a cheap entropy summary for agent-facing status.
+
+        Samples up to 256 KiB per memory block (capped at 8 blocks) so polling
+        ``analysis_status`` stays cheap. Result is cached on the ProgramInfo.
+        """
+        if getattr(program_info, "entropy_computed", False):
+            return program_info.entropy_summary
+        try:
+            from ghidra_nexus.section_entropy import (
+                classify_section,
+                shannon_entropy,
+                summarize_section_classifications,
+            )
+
+            program = program_info.program
+            if program is None:
+                program_info.entropy_summary = "unknown"
+                program_info.entropy_computed = True
+                return "unknown"
+
+            classifications = []
+            blocks = list(program.getMemory().getBlocks())[:8]
+            memory = program.getMemory()
+            for block in blocks:
+                try:
+                    size = int(block.getSize())
+                    sample = min(size, 256 * 1024)
+                    if sample <= 0:
+                        continue
+                    try:
+                        is_x = bool(block.isExecute())
+                    except Exception:
+                        is_x = False
+                    raw = memory.getBytes(block.getStart(), sample)
+                    if raw is None or len(raw) == 0:
+                        continue
+                    ent = shannon_entropy(bytes(raw))
+                    cls, _, _ = classify_section(ent, size, is_executable=is_x)
+                    classifications.append(cls)
+                except Exception:
+                    continue
+
+            summary = summarize_section_classifications(classifications)
+            program_info.entropy_summary = summary
+            program_info.entropy_computed = True
+            return summary
+        except Exception:
+            program_info.entropy_summary = "unknown"
+            program_info.entropy_computed = True
+            return "unknown"
+
+    def get_program_info(
+        self, binary_name: str, *, require_analysis: bool = True
+    ) -> "ProgramInfo":
+        """Get program info or raise :class:`ProgramAccessError`.
+
+        Parameters
+        ----------
+        binary_name
+            Project program name (or unique short name).
+        require_analysis
+            When True (default), refuse access while Ghidra auto-analysis is
+            incomplete — used by decompile / search_code / renames. When False,
+            return the live program even mid-analysis (for survey_binary_fast,
+            section_health, read_bytes, etc.).
+        """
+        from ghidra_nexus.errors import ProgramAccessError, ToolErrorCode
+
         program_info = self._lookup_program_info(binary_name)
         if not program_info:
             with self._programs_lock:
                 available_progs = list(self.programs.keys())
-            raise ValueError(
-                f"Binary '{binary_name}' not found. Available binaries: {available_progs}"
+            raise ProgramAccessError(
+                ToolErrorCode.BINARY_NOT_FOUND,
+                f"Binary '{binary_name}' not found. Available: {available_progs}",
+                binary_name=binary_name,
             )
-        if program_info.dead:
-            raise RuntimeError(
-                f"Binary '{binary_name}' has been deleted and is no longer available."
+        # Use truthy-safe check: Mock() objects without .dead would otherwise
+        # appear deleted (MagicMock is truthy).
+        if getattr(program_info, "dead", False) is True:
+            raise ProgramAccessError(
+                ToolErrorCode.BINARY_DELETED,
+                f"Binary '{binary_name}' has been deleted and is no longer available.",
+                binary_name=binary_name,
             )
-        if not program_info.analysis_complete:
-            raise RuntimeError(
-                f"Analysis incomplete for binary '{binary_name}'. "
-                f"Ghidra analysis: {'complete' if program_info.ghidra_analysis_complete else 'in progress'}. "
-                f"Code index: {'ready' if program_info.code_collection is not None else 'pending'}. "
-                f"String index: {'ready' if program_info.strings is not None else 'pending'}. "
-                f"Wait a few seconds and retry."
+        if require_analysis and not program_info.analysis_complete:
+            raise ProgramAccessError(
+                ToolErrorCode.BINARY_ANALYZING,
+                (
+                    f"Analysis incomplete for binary '{binary_name}'. "
+                    f"Ghidra: {'complete' if program_info.ghidra_analysis_complete else 'in progress'}; "
+                    f"code_index: {'ready' if program_info.code_collection is not None else 'pending'}; "
+                    f"strings_index: {'ready' if program_info.strings is not None else 'pending'}."
+                ),
+                binary_name=binary_name,
             )
-        self.schedule_indexing(program_info.name)
+        if program_info.analysis_complete:
+            # Prefer the caller's name (stable project key) over program_info.name
+            # which may be a short/display name.
+            self.schedule_indexing(binary_name)
         return program_info
 
     def _lookup_program_info(self, binary_name: str) -> "ProgramInfo | None":

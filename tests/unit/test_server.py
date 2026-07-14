@@ -12,7 +12,7 @@ def _common_kwargs():
         "transport": "stdio",
         "project_name": "proj",
         "project_directory": "/tmp/proj",
-        "ghidra_nexus_dir": Path("/tmp/proj-pyghidra-mcp"),
+        "nexus_data_dir": Path("/tmp/proj-ghidra-nexus"),
         "force_analysis": False,
         "verbose_analysis": False,
         "no_symbols": False,

@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from ghidrecomp.callgraph import gen_callgraph
 from jpype import JByte
 
-from ghidra_nexus.errors import ToolErrorCode, classify_decompile_failure, make_tool_error
+from ghidra_nexus.errors import classify_decompile_failure, make_tool_error
 from ghidra_nexus.models import (
     BytesReadResult,
     CallGraphDirection,
@@ -31,7 +31,7 @@ from ghidra_nexus.models import (
     SurveyBinaryResult,
     SymbolInfo,
 )
-from ghidra_nexus.section_entropy import classify_section, shannon_entropy, summarize_section_classifications
+from ghidra_nexus.section_entropy import classify_section, shannon_entropy
 
 _REGEX_META = re.compile(r"[\\^$.|?*+(){}\[\]]")
 
@@ -311,6 +311,7 @@ class GhidraTools:
             result: DecompileResults = decompiler.decompileFunction(func, timeout, monitor)
         error_code: str | None = None
         hint: str | None = None
+        error_text: str | None = None
         if "" == result.getErrorMessage():
             decompiled = result.getDecompiledFunction()
             if decompiled is None:
@@ -322,11 +323,12 @@ class GhidraTools:
                 sig = decompiled.getSignature()
                 status = "decompiled"
         else:
+            # Never put free-text error into `code` — agents treat that as pseudo-C.
             error_msg = result.getErrorMessage()
-            code = error_msg
+            code = ""
             sig = None
             status = "decompiler_error"
-            # Map the Ghidra error string to a stable code.
+            error_text = error_msg
             code_enum = classify_decompile_failure(error_msg)
             error_code = code_enum.value
             err = make_tool_error(
@@ -339,6 +341,7 @@ class GhidraTools:
             name=self._get_filename(func),
             code=code,
             signature=sig,
+            error=error_text,
             decompiler_status=status,
             error_code=error_code,
             hint=hint,
@@ -497,8 +500,6 @@ class GhidraTools:
         a ``Get-ChildItem`` round trip and three ``decompile_function`` calls
         that were going to fail anyway.
         """
-        from ghidra_nexus.models import SectionClassification, SectionRecommendation
-
         blocks = list(self.program.getMemory().getBlocks())
         memory = self.program.getMemory()
         results: list[SectionHealth] = []

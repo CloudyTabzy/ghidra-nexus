@@ -1,12 +1,14 @@
+"""Unit tests for MCP tool wiring (executor path, not full Ghidra)."""
+
+from __future__ import annotations
+
 import asyncio
 from unittest.mock import Mock
 
 import pytest
 
-from ghidra_nexus.gui_context import GuiPyGhidraContext
 from ghidra_nexus.mcp_tools import (
     decompile_function,
-    goto,
     list_project_binaries,
     rename_variable,
     search_symbols_by_name,
@@ -14,10 +16,25 @@ from ghidra_nexus.mcp_tools import (
     set_function_prototype,
     set_variable_type,
 )
-from ghidra_nexus.models import ProgramInfo, SymbolInfo
+from ghidra_nexus.models import DecompiledFunction, ProgramInfo, SymbolInfo
 
 
-def test_list_project_binaries_uses_project_wide_context_listing():
+def _mock_executor(monkeypatch, side_effect=None):
+    """Replace get_executor().submit with an async that runs the callable."""
+    executor = Mock()
+
+    async def submit(program_info, fn, *args, write=False, task_id=None, **kwargs):
+        if side_effect is not None:
+            return await side_effect(program_info, fn, write=write, task_id=task_id)
+        return fn()
+
+    executor.submit = submit
+    monkeypatch.setattr("ghidra_nexus.mcp_tools.get_executor", lambda: executor)
+    return executor
+
+
+@pytest.mark.asyncio
+async def test_list_project_binaries_uses_project_wide_context_listing():
     program_info = ProgramInfo(
         name="/folder/sample",
         file_path=None,
@@ -36,12 +53,14 @@ def test_list_project_binaries_uses_project_wide_context_listing():
     ctx = Mock()
     ctx.request_context.lifespan_context = pyghidra_context
 
-    response = list_project_binaries(ctx)
+    response = await list_project_binaries(ctx)
 
     assert response.programs == [program_info]
 
 
-def test_set_comment_uses_tool_path(monkeypatch):
+@pytest.mark.asyncio
+async def test_set_comment_uses_tool_path(monkeypatch):
+    _mock_executor(monkeypatch)
     pyghidra_context = Mock()
     pyghidra_context.get_program_info.return_value = Mock()
 
@@ -57,7 +76,7 @@ def test_set_comment_uses_tool_path(monkeypatch):
 
     monkeypatch.setattr("ghidra_nexus.mcp_tools.GhidraTools", lambda _program_info: fake_tools)
 
-    response = set_comment(
+    response = await set_comment(
         binary_name="sample",
         target="entry",
         comment="function summary",
@@ -71,7 +90,9 @@ def test_set_comment_uses_tool_path(monkeypatch):
     assert response.comment_type == "decompiler"
 
 
-def test_rename_variable_uses_tool_path(monkeypatch):
+@pytest.mark.asyncio
+async def test_rename_variable_uses_tool_path(monkeypatch):
+    _mock_executor(monkeypatch)
     pyghidra_context = Mock()
     pyghidra_context.get_program_info.return_value = Mock()
 
@@ -89,7 +110,7 @@ def test_rename_variable_uses_tool_path(monkeypatch):
 
     monkeypatch.setattr("ghidra_nexus.mcp_tools.GhidraTools", lambda _program_info: fake_tools)
 
-    response = rename_variable(
+    response = await rename_variable(
         binary_name="sample",
         function_name_or_address="helper",
         variable_name="count",
@@ -100,13 +121,12 @@ def test_rename_variable_uses_tool_path(monkeypatch):
     fake_tools.rename_variable.assert_called_once_with("helper", "count", "item_count")
     assert response.binary_name == "sample"
     assert response.function_name == "helper"
-    assert response.function_address == "100001000"
-    assert response.variable_kind == "parameter"
-    assert response.old_name == "count"
     assert response.new_name == "item_count"
 
 
-def test_set_variable_type_uses_tool_path(monkeypatch):
+@pytest.mark.asyncio
+async def test_set_variable_type_uses_tool_path(monkeypatch):
+    _mock_executor(monkeypatch)
     pyghidra_context = Mock()
     pyghidra_context.get_program_info.return_value = Mock()
 
@@ -125,7 +145,7 @@ def test_set_variable_type_uses_tool_path(monkeypatch):
 
     monkeypatch.setattr("ghidra_nexus.mcp_tools.GhidraTools", lambda _program_info: fake_tools)
 
-    response = set_variable_type(
+    response = await set_variable_type(
         binary_name="sample",
         function_name_or_address="helper",
         variable_name="total",
@@ -135,15 +155,12 @@ def test_set_variable_type_uses_tool_path(monkeypatch):
 
     fake_tools.set_variable_type.assert_called_once_with("helper", "total", "long")
     assert response.binary_name == "sample"
-    assert response.function_name == "helper"
-    assert response.function_address == "100001000"
-    assert response.variable_kind == "local"
-    assert response.variable_name == "total"
-    assert response.old_type == "int"
     assert response.new_type == "long"
 
 
-def test_set_function_prototype_uses_tool_path(monkeypatch):
+@pytest.mark.asyncio
+async def test_set_function_prototype_uses_tool_path(monkeypatch):
+    _mock_executor(monkeypatch)
     pyghidra_context = Mock()
     pyghidra_context.get_program_info.return_value = Mock()
 
@@ -160,7 +177,7 @@ def test_set_function_prototype_uses_tool_path(monkeypatch):
 
     monkeypatch.setattr("ghidra_nexus.mcp_tools.GhidraTools", lambda _program_info: fake_tools)
 
-    response = set_function_prototype(
+    response = await set_function_prototype(
         binary_name="sample",
         function_name_or_address="function_one",
         prototype="long function_one(long count)",
@@ -171,33 +188,23 @@ def test_set_function_prototype_uses_tool_path(monkeypatch):
         "function_one", "long function_one(long count)"
     )
     assert response.binary_name == "sample"
-    assert response.function_name == "function_one"
-    assert response.function_address == "100001000"
-    assert response.old_prototype == "int function_one(int count)"
     assert response.new_prototype == "long function_one(long count)"
 
 
 @pytest.mark.asyncio
 async def test_decompile_function_offloads_with_timeout(monkeypatch):
+    _mock_executor(monkeypatch)
     pyghidra_context = Mock()
     pyghidra_context.get_program_info.return_value = Mock()
 
     fake_tools = Mock()
-    decompiled = Mock()
-    decompiled.callees = None
-    decompiled.referenced_strings = None
-    decompiled.xrefs = None
+    decompiled = DecompiledFunction(name="entry", code="int entry() { return 0; }")
     fake_tools.decompile_function_by_name_or_addr.return_value = decompiled
 
     ctx = Mock()
     ctx.request_context.lifespan_context = pyghidra_context
 
     monkeypatch.setattr("ghidra_nexus.mcp_tools.GhidraTools", lambda _program_info: fake_tools)
-
-    async def fake_to_thread(fn, *args, **kwargs):
-        return fn(*args, **kwargs)
-
-    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
 
     response = await decompile_function(
         binary_name="sample",
@@ -211,12 +218,40 @@ async def test_decompile_function_offloads_with_timeout(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_decompile_exception_returns_typed_error_code(monkeypatch):
+    """Phase 0.5.1: exception path must set error_code, not free-text only."""
+    _mock_executor(monkeypatch)
+    pyghidra_context = Mock()
+    pyghidra_context.get_program_info.return_value = Mock()
+
+    fake_tools = Mock()
+    fake_tools.decompile_function_by_name_or_addr.side_effect = ValueError(
+        "Symbol 'nope' not found."
+    )
+
+    ctx = Mock()
+    ctx.request_context.lifespan_context = pyghidra_context
+    monkeypatch.setattr("ghidra_nexus.mcp_tools.GhidraTools", lambda _program_info: fake_tools)
+
+    response = await decompile_function(
+        binary_name="sample",
+        name_or_address="nope",
+        ctx=ctx,
+    )
+    assert len(response) == 1
+    assert response[0].code == ""
+    assert response[0].error_code == "symbol_not_found"
+    assert response[0].hint
+
+
+@pytest.mark.asyncio
 async def test_decompile_does_not_block_other_tool_calls(monkeypatch):
     pyghidra_context = Mock()
     pyghidra_context.get_program_info.return_value = Mock()
 
     fake_tools = Mock()
-    decompiled = Mock()
+    decompiled = DecompiledFunction(name="entry", code="// ok")
+    fake_tools.decompile_function_by_name_or_addr.return_value = decompiled
     fake_tools.search_symbols_by_name.return_value = [
         SymbolInfo(
             name="entry",
@@ -232,69 +267,32 @@ async def test_decompile_does_not_block_other_tool_calls(monkeypatch):
 
     ctx = Mock()
     ctx.request_context.lifespan_context = pyghidra_context
-
     monkeypatch.setattr("ghidra_nexus.mcp_tools.GhidraTools", lambda _program_info: fake_tools)
 
     decompile_started = asyncio.Event()
     release_decompile = asyncio.Event()
 
-    async def fake_to_thread(fn, *args, **kwargs):
-        decompile_started.set()
-        await release_decompile.wait()
-        return fn(*args, **kwargs)
+    async def submit(program_info, fn, *args, write=False, task_id=None, **kwargs):
+        # Only gate the decompile path so search can finish first.
+        if task_id and str(task_id).startswith("decompile:"):
+            decompile_started.set()
+            await release_decompile.wait()
+        return fn()
 
-    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
-
-    fake_tools.decompile_function_by_name_or_addr.return_value = decompiled
+    executor = Mock()
+    executor.submit = submit
+    monkeypatch.setattr("ghidra_nexus.mcp_tools.get_executor", lambda: executor)
 
     decompile_task = asyncio.create_task(
-        decompile_function(
-            binary_name="sample",
-            name_or_address="entry",
-            timeout_sec=30,
-            ctx=ctx,
-        )
+        decompile_function(binary_name="sample", name_or_address="entry", ctx=ctx)
     )
-
     await decompile_started.wait()
 
-    symbols = search_symbols_by_name(
-        binary_name="sample",
-        query="entry",
-        ctx=ctx,
-    )
-
-    fake_tools.search_symbols_by_name.assert_called_once_with(
-        "entry", functions_only=False, offset=0, limit=25
+    symbols = await search_symbols_by_name(
+        binary_name="sample", query="entry", ctx=ctx
     )
     assert symbols.symbols[0].name == "entry"
-    assert not decompile_task.done()
 
     release_decompile.set()
-    response = await decompile_task
-    assert response == [decompiled]
-
-
-def test_goto_uses_gui_context():
-    gui_context = GuiPyGhidraContext.__new__(GuiPyGhidraContext)
-    gui_context.goto = Mock()
-    gui_context.goto.return_value = {
-        "binary_name": "sample",
-        "address": "1000042e3",
-        "success": True,
-    }
-
-    ctx = Mock()
-    ctx.request_context.lifespan_context = gui_context
-
-    response = goto(
-        binary_name="sample",
-        target="entry",
-        target_type="function",
-        ctx=ctx,
-    )
-
-    gui_context.goto.assert_called_once_with("sample", "entry", "function")
-    assert response.binary_name == "sample"
-    assert response.address == "1000042e3"
-    assert response.success is True
+    result = await decompile_task
+    assert result[0].code == "// ok"

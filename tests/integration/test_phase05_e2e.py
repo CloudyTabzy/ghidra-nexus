@@ -1,4 +1,4 @@
-"""Integration tests for Phase 0.5 — real-binary E2E.
+"""Integration tests for Phase 0.5 / 0.5.1 — real-binary E2E.
 
 These tests need a working Ghidra install. They are skipped if
 :envvar:`GHIDRA_INSTALL_DIR` is not set.
@@ -6,9 +6,7 @@ These tests need a working Ghidra install. They are skipped if
 
 from __future__ import annotations
 
-import asyncio
 import os
-import time
 from pathlib import Path
 
 import pytest
@@ -17,7 +15,6 @@ from ghidra_nexus.errors import ToolErrorCode, make_tool_error
 from ghidra_nexus.section_entropy import shannon_entropy
 
 
-# Skip the whole module if Ghidra isn't installed/configured.
 pytestmark = pytest.mark.skipif(
     not os.environ.get("GHIDRA_INSTALL_DIR"),
     reason="GHIDRA_INSTALL_DIR not set; skipping Ghidra integration tests",
@@ -52,31 +49,55 @@ def find_exe_path():
 
 
 def test_import_binary_returns_task_id_and_canonical_name(ghidra_project, find_exe_path):
-    """Pattern 2 — false success on long operations: validation gate.
-
-    import_binary must NOT report success without:
-        - task_id
-        - binary_name (the canonical project name)
-        - analysis_state != 'failed' if queued
-        - function_count (live)
-        - idb_path
-        - project_path
-        - nexus_data_dir
-    """
+    """Pattern 2 — import returns pollable task fields, never silent success."""
     result = ghidra_project.import_binary_backgrounded(find_exe_path)
     assert result.task_id, "task_id must be present"
     assert result.binary_name, "binary_name must be present"
-    assert result.analysis_state in ("queued", "analyzing_functions", "complete")
+    assert result.analysis_state in ("queued", "analyzing_functions", "complete", "loading")
     assert result.nexus_data_dir
     assert result.project_path
 
 
-def test_analysis_status_returns_path_warnings(ghidra_project):
-    """Pattern 3 — IDB path / project state inconsistencies: path warning surface.
+def test_import_missing_path_raises_program_access_error(ghidra_project):
+    """Pattern 1 — missing path is a structured ProgramAccessError, not FileNotFoundError."""
+    from ghidra_nexus.errors import ProgramAccessError
 
-    Even if the path is healthy, the response shape must include path_warnings
-    as a list.
-    """
+    with pytest.raises(ProgramAccessError) as ei:
+        ghidra_project.import_binary_backgrounded(Path("C:/definitely/not/a/real/binary.exe"))
+    assert ei.value.code is ToolErrorCode.BINARY_PATH_UNREADABLE
+
+
+def test_get_program_info_missing_is_program_access_error(ghidra_project):
+    from ghidra_nexus.errors import ProgramAccessError
+
+    with pytest.raises(ProgramAccessError) as ei:
+        ghidra_project.get_program_info("this_binary_does_not_exist_xyz", require_analysis=False)
+    assert ei.value.code is ToolErrorCode.BINARY_NOT_FOUND
+    body = ei.value.to_tool_error_dict()
+    assert body["fallback_tool"] == "list_project_binaries"
+    assert body["ok"] is False
+
+
+def test_list_project_binary_infos_includes_function_count_field(ghidra_project, find_exe_path):
+    """Pattern 2 — status fields must be present (even if count is still 0 mid-import)."""
+    ghidra_project.import_binary_backgrounded(find_exe_path)
+    infos = ghidra_project.list_project_binary_infos()
+    # May be empty if import not finished; if present, must have typed fields.
+    for info in infos:
+        assert hasattr(info, "function_count")
+        assert isinstance(info.function_count, int)
+        assert info.function_count >= 0
+        assert info.entropy_summary in (
+            "unknown",
+            "normal",
+            "encrypted",
+            "compressed",
+            "mixed",
+        )
+
+
+def test_analysis_status_returns_path_warnings(ghidra_project):
+    """Pattern 3 — response shape includes path_warnings as a list."""
     from ghidra_nexus.models import AnalysisStatusResult
 
     binaries = ghidra_project.list_project_binary_infos()
@@ -90,11 +111,7 @@ def test_analysis_status_returns_path_warnings(ghidra_project):
 
 
 def test_section_health_classifies_find_exe(find_exe_path):
-    """Pattern 4 — section entropy trap: detect encrypted .text.
-
-    find.exe has low entropy (real code), not encrypted. The test asserts the
-    pipeline gives sane output for a normal binary.
-    """
+    """Pattern 4 — entropy pipeline gives sane output for a normal binary."""
     from ghidra_nexus.section_entropy import classify_section
 
     data = find_exe_path.read_bytes()
@@ -102,17 +119,12 @@ def test_section_health_classifies_find_exe(find_exe_path):
     cls, rec, _ = classify_section(
         entropy=e, size_bytes=len(data), is_executable=True
     )
-    # find.exe should be 'code' or maybe 'compressed' if packed
-    # (depends on OS version), but never 'encrypted' on a vanilla machine
     assert cls.value in ("code", "compressed", "data")
 
 
-def test_decompile_failure_returns_typed_error_code(monkeypatch):
-    """Pattern 5 — opaque decompile failures: ToolError with stable code.
-
-    We don't need real Ghidra — we test classify_decompile_failure directly.
-    """
-    from ghidra_nexus.errors import classify_decompile_failure
+def test_decompile_failure_returns_typed_error_code():
+    """Pattern 5 — ToolError with stable code."""
+    from ghidra_nexus.errors import classify_decompile_failure, decompile_failure_result
 
     assert (
         classify_decompile_failure("No decompiler license available")
@@ -123,28 +135,33 @@ def test_decompile_failure_returns_typed_error_code(monkeypatch):
         is ToolErrorCode.DECOMPILE_TOO_SMALL
     )
     body = make_tool_error(
-        ToolErrorCode.DECOMPILE_ENCRYPTED, "Function is encrypted",
-        binary_name="find.exe", addr="0x401000",
+        ToolErrorCode.DECOMPILE_ENCRYPTED,
+        "Function is encrypted",
+        binary_name="find.exe",
+        addr="0x401000",
     )
     assert body["error_code"] == "encrypted_bytes"
     assert body["fallback_tool"] == "disassemble"
 
+    fields = decompile_failure_result("stub", "Symbol 'x' not found.", binary_name="find.exe")
+    assert fields["code"] == ""
+    assert fields["error_code"] == "symbol_not_found"
+
 
 def test_check_project_path_writable_clean():
-    """Pattern 3 — path check helper returns clean list for healthy path."""
     from ghidra_nexus.server import _check_project_path_writable
 
     warnings = _check_project_path_writable(Path("C:/tmp/some/clean/path"))
-    # Either empty list or only warnings we don't expect on Windows
     assert isinstance(warnings, list)
 
 
 def test_check_project_path_writable_flags_program_files():
-    """Pattern 3 — path check helper flags Program Files subdirs."""
     from ghidra_nexus.server import _check_project_path_writable
 
     warnings = _check_project_path_writable(Path("C:/Program Files/GhidraNexus"))
-    if os.name == "nt":  # only meaningful on Windows
+    if os.name == "nt":
         assert any("UAC" in w or "Program Files" in w for w in warnings), (
             f"expected Program Files warning, got {warnings}"
         )
+    # Message must not say "IDA"
+    assert all("IDA" not in w for w in warnings)
