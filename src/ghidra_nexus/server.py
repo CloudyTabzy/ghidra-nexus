@@ -134,6 +134,8 @@ def register_common_tools(server: FastMCP) -> None:
     server.tool()(mcp_tools.notebook_breadcrumbs)
     server.tool()(mcp_tools.notebook_alias)
     server.tool()(mcp_tools.notebook_hypothesis)
+    server.tool()(mcp_tools.notebook_embed_status)
+    server.tool()(mcp_tools.notebook_rebuild_embeddings)
 
 
 def register_gui_tools(server: FastMCP) -> None:
@@ -266,6 +268,39 @@ def _start_infrastructure(pyghidra_context) -> None:
     )
     watchdog.start()
     set_watchdog(watchdog)
+    # Start the notebook embed worker (Phase 3) so FTS writes get drained
+    # into sqlite-vec. Best-effort: missing deps leave FTS-only mode.
+    try:
+        nexus_data_dir = getattr(pyghidra_context, "nexus_data_dir", None)
+        if nexus_data_dir:
+            from pathlib import Path as _Path
+            from ghidra_nexus.notebook.store import Notebook as _Nb
+            from ghidra_nexus.notebook.embedder import get_embedder
+            from ghidra_nexus.notebook.embed_worker import EmbedWorker
+            nb = _Nb.open(str(_Path(nexus_data_dir) / "notebook.sqlite"))
+            worker = EmbedWorker(nb, get_embedder())
+            worker.start()
+            logger.info("notebook embed worker started (vec_available=%s)", nb.vec_available)
+    except Exception as e:
+        logger.debug("notebook embed worker startup failed (FTS-only): %s", e)
+
+
+def _stop_infrastructure() -> None:
+    """Stop the watchdog, executor, and notebook embed worker.
+
+    Idempotent: safe to call multiple times.
+    """
+    from ghidra_nexus.ghidra_executor import get_executor as _ge
+    from ghidra_nexus.watchdog import get_watchdog as _gw
+    from ghidra_nexus.mcp_tools import _stop_embed_worker
+
+    wd = _gw()
+    if wd is not None:
+        wd.stop()
+    executor = _ge()
+    if executor is not None:
+        executor.shutdown(timeout=5.0)
+    _stop_embed_worker()
 
 
 def init_gui_context(
@@ -296,6 +331,20 @@ def init_gui_context(
     )
     watchdog.start()
     set_watchdog(watchdog)
+    # Start the notebook embed worker (Phase 3)
+    try:
+        nexus_data_dir = getattr(gui_context, "nexus_data_dir", None)
+        if nexus_data_dir:
+            from pathlib import Path as _Path
+            from ghidra_nexus.notebook.store import Notebook as _Nb
+            from ghidra_nexus.notebook.embedder import get_embedder
+            from ghidra_nexus.notebook.embed_worker import EmbedWorker
+            nb = _Nb.open(str(_Path(nexus_data_dir) / "notebook.sqlite"))
+            worker = EmbedWorker(nb, get_embedder())
+            worker.start()
+            logger.info("notebook embed worker started (vec_available=%s)", nb.vec_available)
+    except Exception as e:
+        logger.debug("notebook embed worker startup failed (FTS-only): %s", e)
 
     return mcp
 
@@ -548,14 +597,7 @@ def main(
         finally:
             launcher.request_shutdown()
             launcher.wait_for_shutdown()
-            from ghidra_nexus.ghidra_executor import get_executor as _ge
-            from ghidra_nexus.watchdog import get_watchdog as _gw
-            wd = _gw()
-            if wd is not None:
-                wd.stop()
-            executor = _ge()
-            if executor is not None:
-                executor.shutdown(timeout=5.0)
+            _stop_infrastructure()
             context = getattr(mcp, "_pyghidra_context", None)
             if context is not None:
                 context.close()
@@ -620,12 +662,7 @@ def main(
             if stats.get("queue_depth", 0) > 50:
                 logger.warning("Executor queue congested: %s", stats)
 
-        from ghidra_nexus.watchdog import get_watchdog as _gw
-        wd = _gw()
-        if wd is not None:
-            wd.stop()
-        if executor is not None:
-            executor.shutdown(timeout=5.0)
+        _stop_infrastructure()
         mcp._pyghidra_context.close()  # type: ignore
         return
 
@@ -666,15 +703,7 @@ def main(
     try:
         run_mcp_server(mcp, transport)
     finally:
-        from ghidra_nexus.ghidra_executor import get_executor as _ge
-        from ghidra_nexus.watchdog import get_watchdog as _gw
-
-        wd = _gw()
-        if wd is not None:
-            wd.stop()
-        executor = _ge()
-        if executor is not None:
-            executor.shutdown(timeout=5.0)
+        _stop_infrastructure()
         mcp._pyghidra_context.close()  # type: ignore
 
 

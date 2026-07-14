@@ -84,6 +84,7 @@ def test_schedule_startup_indexing_skips_large_projects():
     context = PyGhidraContext.__new__(PyGhidraContext)
     context.programs = {f"/bin/{i}": Mock(analysis_complete=True) for i in range(11)}
     context.schedule_indexing = Mock()
+    context.chroma_client = Mock()
 
     context.schedule_startup_indexing(max_binaries=10)
 
@@ -100,6 +101,8 @@ def test_schedule_startup_indexing_indexes_small_projects():
     program_b.analysis_complete = True
     context.programs = {"/bin/a": program_a, "/bin/b": program_b}
     context.schedule_indexing = Mock()
+    # Phase 3 demotion: a non-None chroma_client gates indexing work.
+    context.chroma_client = Mock()
 
     context.schedule_startup_indexing(max_binaries=10)
 

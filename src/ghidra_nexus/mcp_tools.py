@@ -19,10 +19,14 @@ Phase 2 cache contract:
 import asyncio
 import functools
 import logging
+import sqlite3
 import threading
 import time as _time
 from pathlib import Path
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
+
+if TYPE_CHECKING:
+    from ghidra_nexus.notebook.store import Notebook
 
 from mcp.server.fastmcp import Context
 from mcp.shared.exceptions import McpError
@@ -173,7 +177,80 @@ async def _get_notebook(pyghidra_context=None) -> Notebook:
                 from pathlib import Path as _Path
                 path = str(_Path(ndd) / "notebook.sqlite")
         _NOTEBOOK_SINGLETON = Notebook.open(path)
+        # Lazily start the embed worker so FTS writes get drained to vec.
+        # Best-effort: any failure (missing deps, sqlite-vec unavailable)
+        # leaves FTS-only mode intact.
+        # Skip during tests — set NEXUS_DISABLE_EMBED_WORKER=1 in test env.
+        import os as _os
+        if not _os.environ.get("NEXUS_DISABLE_EMBED_WORKER"):
+            try:
+                _get_embed_worker()
+            except Exception:
+                pass
         return _NOTEBOOK_SINGLETON
+
+
+# ---------------------------------------------------------------------------
+# Embed worker (Phase 3) — drains embed_queue in a daemon thread.
+# ---------------------------------------------------------------------------
+_EMBED_WORKER = None
+_EMBED_WORKER_LOCK = threading.Lock()
+
+
+def _get_embed_worker() -> "EmbedWorker | None":
+    """Return the embed worker singleton, creating it lazily.
+
+    Returns ``None`` if the embed queue is empty / vec unavailable; the worker
+    still attaches but stays idle. ``start()`` is idempotent — calling twice
+    is safe. Disabled by setting env ``NEXUS_DISABLE_EMBED_WORKER=1`` for
+    tests so the worker doesn't interfere with asyncio event loops.
+    """
+    global _EMBED_WORKER
+    if _EMBED_WORKER is not None:
+        return _EMBED_WORKER
+    import os as _os
+    if _os.environ.get("NEXUS_DISABLE_EMBED_WORKER"):
+        return None
+    with _EMBED_WORKER_LOCK:
+        if _EMBED_WORKER is not None:
+            return _EMBED_WORKER
+        try:
+            from ghidra_nexus.notebook.embed_worker import EmbedWorker
+            from ghidra_nexus.notebook.embedder import get_embedder
+        except ImportError:
+            return None
+        # Synchronous path: caller cannot await, but the worker itself uses a
+        # background thread. We need the notebook synchronously.
+        try:
+            nb = _NOTEBOOK_SINGLETON or _try_open_default_notebook()
+            if nb is None:
+                return None
+            worker = EmbedWorker(nb, get_embedder())
+            worker.start()
+            _EMBED_WORKER = worker
+            return worker
+        except Exception as e:
+            logger.debug("embed worker init failed: %s", e)
+            return None
+
+
+def _try_open_default_notebook() -> Notebook | None:
+    """Best-effort: open notebook at the default path."""
+    try:
+        return Notebook.open("ghidra_nexus_projects/my_project-nexus/notebook.sqlite")
+    except Exception:
+        return None
+
+
+def _stop_embed_worker() -> None:
+    """Stop the worker if running (called on daemon shutdown)."""
+    global _EMBED_WORKER
+    if _EMBED_WORKER is not None:
+        try:
+            _EMBED_WORKER.stop()
+        except Exception:
+            pass
+        _EMBED_WORKER = None
 
 
 def _get_binary_meta(
@@ -438,14 +515,25 @@ async def search_code(
     limit: int = 5,
     offset: int = 0,
     search_mode: Literal["semantic", "literal", "hybrid"] = "hybrid",
-    include_full_code: bool = True,
+    include_full_code: bool = False,
     preview_length: int = 500,
     similarity_threshold: float = 0.0,
+    min_quality: Literal["ok", "stub", "empty", "encrypted", "any"] = "any",
 ) -> CodeSearchResults:
     """Semantic / lexical search over the notebook knowledge plane.
 
-    Backend: notebook/sqlite-vec hybrid (default), FTS-only (fallback).
-    Set env ``NEXUS_SEMANTIC_BACKEND=chromadb`` for the legacy path.
+    Default backend: notebook/sqlite-vec hybrid (FTS5 + vec KNN → RRF merge).
+    Falls back to FTS-only when sqlite-vec is unavailable.
+    Set env ``NEXUS_SEMANTIC_BACKEND=chromadb`` for the legacy ChromaDB path.
+
+    Args:
+        search_mode: ``hybrid`` (FTS + vec → RRF), ``literal`` (FTS only),
+            ``semantic`` (vec KNN only).
+        include_full_code: Default ``False`` — hit payloads carry summary preview
+            only. Set ``True`` to also return the gzipped full decompile window
+            for each hit (still subject to ``preview_length``).
+        min_quality: Filter views whose ``quality_hint`` is below this threshold.
+            ``any`` returns everything; ``ok`` hides stubs/empty/encrypted.
     """
     import os as _os
 
@@ -465,6 +553,19 @@ async def search_code(
     bid = b["id"] if b else 0
     vec_available = nb.vec_available
 
+    # F1 capability envelope: refuse empty query on very_large binaries to
+    # avoid unbounded scans (reliability_notes from classify_binary()).
+    if not query or not query.strip():
+        if b and b.get("binary_class") in {"large", "very_large"}:
+            return CodeSearchResults(
+                results=[], query=query,
+                search_mode=SearchMode(search_mode if search_mode != "hybrid" else "semantic"),
+                vec_available=vec_available, vec_index_complete=False,
+                backend="fts_only", returned_count=0, offset=offset, limit=limit,
+                total_functions=0, literal_total=0, semantic_total=0,
+                reliability_notes=["empty query refused on large/very_large binary"],
+            )
+
     query_vec = None
     if vec_available and search_mode in ("semantic", "hybrid"):
         from ghidra_nexus.notebook.embedder import get_embedder
@@ -476,22 +577,102 @@ async def search_code(
         kind=None, limit=limit, offset=offset,
         vec_available=vec_available and query_vec is not None)
 
+    # Apply min_quality filter (post-filter; small result sets, <50ms typical)
+    if min_quality != "any":
+        result["results"] = _filter_by_quality(
+            nb.conn, result["results"], min_quality
+        )
+        result["returned"] = len(result["results"])
+
+    # Resolve vec_index_complete from notebook
+    vec_index_complete = bool((b or {}).get("vec_index_complete", 0))
+
     hits = []
     for h in result["results"]:
         preview = h.get("snippet", "")[:preview_length]
+        if include_full_code:
+            # Resolve the full decompile window from cache if requested
+            full = _resolve_full_code(nb, h, preview_length)
+            code_payload = full or preview
+        else:
+            code_payload = preview
         hits.append(CodeSearchResult(
             function_name=h.get("name", ""),
-            code=preview if not include_full_code else f"rva:{h.get('rva','')} name:{h.get('name','')}",
-            similarity=float(h.get("score", 0)), search_mode=SearchMode(search_mode if search_mode != "hybrid" else "semantic"),
-            preview=preview))
+            code=code_payload,
+            similarity=float(h.get("score", 0)),
+            search_mode=SearchMode(search_mode if search_mode != "hybrid" else "semantic"),
+            preview=preview,
+        ))
 
     return CodeSearchResults(
         results=hits, query=query,
         search_mode=SearchMode(search_mode if search_mode != "hybrid" else "semantic"),
-        vec_available=result["vec_available"], vec_index_complete=False, backend=result["backend"],
-        returned_count=result["returned"], offset=offset, limit=limit,
+        vec_available=result["vec_available"],
+        vec_index_complete=vec_index_complete,
+        backend=result["backend"],
+        returned_count=result["returned"],
+        offset=offset, limit=limit,
         total_functions=result["total_fts"] + result["total_vec"],
-        literal_total=result["total_fts"], semantic_total=result["total_vec"])
+        literal_total=result["total_fts"],
+        semantic_total=result["total_vec"],
+    )
+
+
+def _filter_by_quality(
+    conn: "sqlite3.Connection",
+    hits: list[dict],
+    min_quality: str,
+) -> list[dict]:
+    """Drop hits whose source artifact_view has quality_hint below ``min_quality``.
+
+    Quality ordering: stub < empty < encrypted < ok.
+    """
+    _QUALITY_ORDER = {"stub": 0, "empty": 1, "encrypted": 2, "ok": 3, "unknown": 1}
+    threshold = _QUALITY_ORDER.get(min_quality, 0)
+    out = []
+    for h in hits:
+        rva = h.get("rva", "")
+        kind = h.get("kind", "")
+        binary_id = h.get("binary_id")
+        if not rva or not binary_id:
+            out.append(h)
+            continue
+        row = conn.execute(
+            "SELECT quality_hint FROM artifact_views WHERE binary_id = ? AND rva = ? AND kind = ? ORDER BY id DESC LIMIT 1",
+            (binary_id, rva, kind),
+        ).fetchone()
+        q = row[0] if row else "unknown"
+        if _QUALITY_ORDER.get(q, 0) >= threshold:
+            out.append(h)
+    return out
+
+
+def _resolve_full_code(
+    nb: "Notebook",
+    hit: dict,
+    preview_length: int,
+) -> str | None:
+    """Best-effort: pull the cached decompile blob for a hit and return a window.
+
+    Returns None on miss so the caller can fall back to the preview snippet.
+    """
+    rva = hit.get("rva", "")
+    binary_id = hit.get("binary_id")
+    if not rva or not binary_id:
+        return None
+    try:
+        cached = nb.decompiles.get(binary_id, rva)
+    except Exception:
+        return None
+    if not cached:
+        return None
+    code = cached.get("code_text", "")
+    if not code:
+        return None
+    from ghidra_nexus.notebook.pagination import window_text
+
+    page = window_text(code, offset=0, limit=preview_length // 24)
+    return page.text
 
 
 @mcp_error_handler
@@ -1302,6 +1483,151 @@ async def notebook_hypothesis(action: str, ctx: Context, id: int | None = None, 
 
 
 @mcp_error_handler
+async def notebook_embed_status(ctx: Context, binary_name: str | None = None) -> dict:
+    """Inspect the embed queue + vec index status.
+
+    Returns aggregate counters (pending/done/error/skipped) for the queue and
+    per-binary vec readiness. If ``binary_name`` is given, narrows to that
+    binary. ``None`` returns project-wide rollup.
+
+    The ``embed_worker`` running flag reflects whether a background drainer
+    is attached to this notebook. If false, the queue accumulates but the
+    worker is idle (e.g. vec unavailable or embedder failed to load).
+    """
+    nb = await _get_notebook()
+    worker = _get_embed_worker()
+    # Queue counters via raw SQL (single round-trip)
+    queue_counts = {
+        r[0]: int(r[1])
+        for r in nb.conn.execute(
+            "SELECT status, COUNT(*) FROM embed_queue GROUP BY status"
+        ).fetchall()
+    }
+    for k in ("pending", "done", "error", "skipped"):
+        queue_counts.setdefault(k, 0)
+
+    if binary_name:
+        b = nb.binaries.get(binary_name)
+        if not b:
+            raise _ToolRecoverable(
+                ToolErrorCode.BINARY_NOT_FOUND,
+                f"Binary {binary_name!r} not in notebook",
+                binary_name=binary_name,
+            )
+        bid = b["id"]
+        binary_summary = {
+            "name": b["name"],
+            "binary_class": b["binary_class"],
+            "vec_available": nb.vec_available,
+            "vec_status": b.get("vec_status", "unavailable"),
+            "vec_index_complete": bool(b.get("vec_index_complete", 0)),
+            "embed_progress": b.get("embed_progress", 0),
+            "embed_target": b.get("embed_target", 0),
+            "embed_model": b.get("embed_model"),
+            "views_count": nb.views.count_for_binary(bid),
+            "embeddings_count": nb.embeddings.count_for_binary(bid),
+        }
+        return {
+            "embed_worker_running": worker.running if worker else False,
+            "embed_worker_errors": worker._total_errors if worker else 0,
+            "embed_worker_processed": worker._total_processed if worker else 0,
+            "queue_counts": queue_counts,
+            "binary": binary_summary,
+        }
+
+    # Project-wide rollup
+    binaries = nb.binaries.all()
+    return {
+        "embed_worker_running": worker.running if worker else False,
+        "embed_worker_errors": worker._total_errors if worker else 0,
+        "embed_worker_processed": worker._total_processed if worker else 0,
+        "queue_counts": queue_counts,
+        "binaries": [
+            {
+                "name": b["name"],
+                "binary_class": b["binary_class"],
+                "vec_status": b.get("vec_status", "unavailable"),
+                "vec_index_complete": bool(b.get("vec_index_complete", 0)),
+                "embed_progress": b.get("embed_progress", 0),
+                "embed_target": b.get("embed_target", 0),
+                "views_count": nb.views.count_for_binary(b["id"]),
+                "embeddings_count": nb.embeddings.count_for_binary(b["id"]),
+            }
+            for b in binaries
+        ],
+    }
+
+
+@mcp_error_handler
+async def notebook_rebuild_embeddings(
+    ctx: Context,
+    binary_name: str | None = None,
+) -> dict:
+    """Rebuild the sqlite-vec index from scratch.
+
+    Behavior:
+      - If ``binary_name`` is given: delete that binary's embeddings + vec0
+        rows, mark its vec_index_complete=False, then enqueue every view for
+        re-embedding. The worker (if running) drains the queue automatically.
+      - If ``binary_name`` is None: rebuild for ALL binaries in the project.
+
+    Use this when ``search_code`` shows ``vec_index_complete=false`` but
+    ``embed_progress >= embed_target`` (stuck) or after a model upgrade.
+    """
+    nb = await _get_notebook()
+    if not nb.vec_available:
+        raise _ToolRecoverable(
+            ToolErrorCode.SEMANTIC_BACKEND_UNAVAILABLE,
+            "sqlite-vec not loaded; cannot rebuild embeddings. Install `sqlite-vec` or set SQLITE_VEC_PATH.",
+        )
+
+    targets: list[tuple[int, str]] = []
+    if binary_name:
+        b = nb.binaries.get(binary_name)
+        if not b:
+            raise _ToolRecoverable(
+                ToolErrorCode.BINARY_NOT_FOUND,
+                f"Binary {binary_name!r} not in notebook",
+                binary_name=binary_name,
+            )
+        targets.append((b["id"], b["name"]))
+    else:
+        for b in nb.binaries.all():
+            targets.append((b["id"], b["name"]))
+
+    total_views_requeued = 0
+    for bid, name in targets:
+        # Drop embeddings meta + vec0 rows for this binary
+        nb.embeddings.delete_for_binary(bid)
+        try:
+            from ghidra_nexus.notebook.vec import delete_vecs_for_binary
+            delete_vecs_for_binary(nb.conn, bid)
+        except Exception:
+            pass
+        # Reset binary vec status
+        nb.binaries.set_vec_status(
+            name, vec_available=nb.vec_available, model=None,
+            index_complete=False, progress=0, target=0,
+        )
+        # Re-enqueue every view
+        for view in nb.conn.execute(
+            "SELECT id FROM artifact_views WHERE binary_id = ?", (bid,)
+        ).fetchall():
+            vid = int(view[0])
+            nb.embed_queue.enqueue(vid)
+            total_views_requeued += 1
+
+    # Bump the worker (lazy start if not running)
+    _get_embed_worker()
+    return {
+        "rebuild_started": True,
+        "binaries_affected": [name for _, name in targets],
+        "views_requeued": total_views_requeued,
+        "hint": "call notebook_embed_status to monitor progress",
+    }
+
+
+@mcp_error_handler
 async def save(ctx: Context) -> SaveRequestResult:
     pyghidra_context = _get_context(ctx)
     pyghidra_context.save()
@@ -1344,6 +1670,8 @@ def _register_all_on_demand(mcp_server):
         (notebook_breadcrumbs, "notebook_breadcrumbs"),
         (notebook_alias, "notebook_alias"),
         (notebook_hypothesis, "notebook_hypothesis"),
+        (notebook_embed_status, "notebook_embed_status"),
+        (notebook_rebuild_embeddings, "notebook_rebuild_embeddings"),
     ]
     for fn, name in tools:
         try:

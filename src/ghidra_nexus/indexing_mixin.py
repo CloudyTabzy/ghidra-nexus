@@ -4,9 +4,6 @@ import threading
 from pathlib import Path
 from typing import Any
 
-import chromadb
-from chromadb.config import Settings
-
 from ghidra_nexus.tools import GhidraTools
 
 logger = logging.getLogger(__name__)
@@ -18,22 +15,46 @@ COLLECTION_COMPLETE_KEY = "nexus_index_complete"
 
 
 class IndexingMixin:
-    """Shared MCP-side indexing behavior for headless and GUI contexts."""
+    """Shared MCP-side indexing behavior for headless and GUI contexts.
+
+    ChromaDB is a SECOND-CLASS backend (Phase 3 demotion). It is only imported
+    and started when ``NEXUS_SEMANTIC_BACKEND=chromadb`` is set. The default
+    semantic path is the notebook's sqlite-vec KNN + FTS5 hybrid.
+
+    All ChromaDB references are guarded so the daemon starts instantly even
+    when ``chromadb`` is not installed.
+    """
 
     programs: dict[str, Any]
 
     def _init_indexing_state(self, nexus_data_dir: Path, *, threaded: bool) -> None:
         """Initialize ChromaDB ONLY when NEXUS_SEMANTIC_BACKEND=chromadb.
 
-        Phase 3 demotion: by default, ChromaDB is NOT started. The notebook's
-        sqlite-vec path serves all semantic queries. Set the env var to restore
-        the legacy ChromaDB backend.
+        Phase 3 demotion: by default, ChromaDB is NOT imported and NOT started.
+        The notebook's sqlite-vec path serves all semantic queries. Set the
+        env var to restore the legacy ChromaDB backend.
         """
         import os as _os
 
         use_chromadb = _os.environ.get("NEXUS_SEMANTIC_BACKEND") == "chromadb"
         chromadb_path = nexus_data_dir / "chromadb"
         if use_chromadb:
+            try:
+                import chromadb
+                from chromadb.config import Settings
+            except ImportError as e:
+                logger.warning(
+                    "NEXUS_SEMANTIC_BACKEND=chromadb but chromadb import failed: %s. "
+                    "Falling back to sqlite-vec semantic backend.", e,
+                )
+                self.chroma_client = None
+                self.index_executor = (
+                    concurrent.futures.ThreadPoolExecutor(max_workers=1) if threaded else None
+                )
+                self._index_futures: dict[str, concurrent.futures.Future] = {}
+                self._index_lock = threading.Lock()
+                return
+
             chromadb_path.mkdir(parents=True, exist_ok=True)
             try:
                 self.chroma_client = chromadb.PersistentClient(
@@ -77,6 +98,9 @@ class IndexingMixin:
         strings: bool = True,
     ) -> bool:
         """Schedule MCP-side indexing for a binary when it is relevant."""
+        if self.chroma_client is None:
+            # ChromaDB demoted; no work to schedule.
+            return False
         program_info = self._lookup_program_info(binary_name)
         if program_info is None or not program_info.analysis_complete:
             return False
@@ -110,6 +134,8 @@ class IndexingMixin:
 
     def schedule_startup_indexing(self, *, max_binaries: int | None = 10) -> None:
         """Eagerly index only manageable existing projects on startup."""
+        if self.chroma_client is None:
+            return
         analyzed_programs = [
             program_info
             for program_info in self.programs.values()
@@ -134,6 +160,8 @@ class IndexingMixin:
         collection on disk. Such a collection (and any legacy one lacking the
         marker) is deleted here so the caller rebuilds it from scratch.
         """
+        if self.chroma_client is None:
+            return None
         try:
             collection = self.chroma_client.get_collection(name=name)
         except Exception:
@@ -156,6 +184,8 @@ class IndexingMixin:
         )
 
     def _init_chroma_code_collection_for_program(self, program_info: Any) -> None:
+        if self.chroma_client is None:
+            return
         from ghidra.program.model.listing import Function
 
         logger.info("Initializing Chroma code collection for %s", program_info.name)

@@ -86,6 +86,10 @@ class ToolErrorCode(str, Enum):
     SERVER_NOT_READY = "server_not_ready"
     TOOL_GUI_REQUIRED = "tool_requires_gui"
 
+    # ----- Notebook / knowledge plane -----
+    SEMANTIC_BACKEND_UNAVAILABLE = "semantic_backend_unavailable"
+    NOTEBOOK_NOT_READY = "notebook_not_ready"
+
     # ----- Catch-all -----
     UNKNOWN = "unknown_error"
 
@@ -126,6 +130,13 @@ REGISTERED_TOOL_NAMES: frozenset[str] = frozenset(
         "get_gui_context",
         "wake_ghidra",
         "ghidra_status",
+        "notebook_summary",
+        "notebook_search",
+        "notebook_breadcrumbs",
+        "notebook_alias",
+        "notebook_hypothesis",
+        "notebook_embed_status",
+        "notebook_rebuild_embeddings",
     }
 )
 
@@ -160,6 +171,9 @@ _FALLBACK_TOOL: dict[ToolErrorCode, str] = {
     # Lifecycle
     ToolErrorCode.SERVER_NOT_READY: "analysis_status",
     ToolErrorCode.TOOL_GUI_REQUIRED: "list_open_programs",
+    # Notebook
+    ToolErrorCode.SEMANTIC_BACKEND_UNAVAILABLE: "notebook_embed_status",
+    ToolErrorCode.NOTEBOOK_NOT_READY: "notebook_summary",
 }
 
 

@@ -7,7 +7,14 @@ indexed forever with missing/zero functions.
 
 These tests exercise the gate against a real PersistentClient (no Ghidra runtime
 needed), reopening the client between steps to prove the marker is durable.
+
+Phase 3 demotion: chromadb is opt-in via NEXUS_SEMANTIC_BACKEND=chromadb. Each
+test sets the env var for its lifetime so the client is initialized.
 """
+
+import os
+
+import pytest
 
 from ghidra_nexus.indexing_mixin import COLLECTION_COMPLETE_KEY, IndexingMixin
 
@@ -17,6 +24,12 @@ class _Probe(IndexingMixin):
 
     def __init__(self, path):
         self._init_indexing_state(path, threaded=False)
+
+
+@pytest.fixture(autouse=True)
+def _enable_chromadb(monkeypatch):
+    """Force the chromadb backend on for the duration of each test."""
+    monkeypatch.setenv("NEXUS_SEMANTIC_BACKEND", "chromadb")
 
 
 def _reopen(path):
@@ -71,3 +84,16 @@ def test_collection_without_marker_is_treated_as_incomplete(tmp_path):
 
     probe2 = _reopen(tmp_path)
     assert probe2._open_complete_collection("bin_legacy") is None
+
+
+def test_default_backend_skips_chromadb(tmp_path, monkeypatch):
+    """Without NEXUS_SEMANTIC_BACKEND=chromadb, no client is created.
+
+    This proves the demotion: the daemon starts instantly even when chromadb
+    is not installed because the import is lazy.
+    """
+    monkeypatch.delenv("NEXUS_SEMANTIC_BACKEND", raising=False)
+    probe = IndexingMixin()
+    probe.programs = {}
+    probe._init_indexing_state(tmp_path, threaded=False)
+    assert probe.chroma_client is None
