@@ -55,12 +55,12 @@ class DecompilerPool:
                 return self._create()
             try:
                 return self._queue.get(timeout=self._acquire_timeout)
-            except queue.Empty:
+            except queue.Empty as e:
                 raise RuntimeError(
                     f"DecompilerPool exhausted: all {self._size} decompilers busy "
                     f"after {self._acquire_timeout}s. Reduce concurrent decompile requests "
                     f"or increase pool size."
-                )
+                ) from e
 
     @contextmanager
     def acquire(self):

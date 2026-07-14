@@ -318,7 +318,7 @@ def _error_tool_response(
     return make_tool_error(code, message, **kwargs)
 
 
-class _ToolRecoverable(Exception):
+class _ToolRecoverable(Exception):  # noqa: N818 — historical name kept for compat
     """Marker exception: errors that the agent can recover from.
 
     Raise ``_ToolRecoverable(ToolErrorCode.SYMBOL_NOT_FOUND, "...")`` from a tool
@@ -809,8 +809,8 @@ def _filter_by_quality(
 
     Quality ordering: stub < empty < encrypted < ok.
     """
-    _QUALITY_ORDER = {"stub": 0, "empty": 1, "encrypted": 2, "ok": 3, "unknown": 1}
-    threshold = _QUALITY_ORDER.get(min_quality, 0)
+    quality_order = {"stub": 0, "empty": 1, "encrypted": 2, "ok": 3, "unknown": 1}
+    threshold = quality_order.get(min_quality, 0)
     out = []
     for h in hits:
         rva = h.get("rva", "")
@@ -824,7 +824,7 @@ def _filter_by_quality(
             (binary_id, rva, kind),
         ).fetchone()
         q = row[0] if row else "unknown"
-        if _QUALITY_ORDER.get(q, 0) >= threshold:
+        if quality_order.get(q, 0) >= threshold:
             out.append(h)
     return out
 

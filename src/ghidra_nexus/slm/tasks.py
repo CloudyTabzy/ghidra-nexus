@@ -108,7 +108,7 @@ def _invoke_slm(
 
     Raises RuntimeError on timeout / generation failure.
     """
-    tokenizer, model, cfg = get_model()
+    tokenizer, model, _cfg = get_model()
 
     messages = [
         {"role": "system", "content": prompt.system},

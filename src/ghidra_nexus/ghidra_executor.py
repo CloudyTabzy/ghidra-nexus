@@ -137,11 +137,11 @@ class GhidraExecutor:
         await self._queue.put((task_id or "unknown", program_info, fn, result_queue))
         try:
             result = await asyncio.wait_for(result_queue.get(), timeout=self._task_timeout)
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as e:
             raise RuntimeError(
                 f"Task '{task_id}' timed out after {self._task_timeout}s. "
                 f"Reduce concurrent load or increase timeout."
-            )
+            ) from e
         if isinstance(result, Exception):
             raise result
         return result

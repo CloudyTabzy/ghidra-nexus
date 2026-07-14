@@ -8,6 +8,10 @@ from ghidra_nexus.tools import GhidraTools
 
 logger = logging.getLogger(__name__)
 
+# Maximum acceptable decompile failure rate before a code index is
+# considered broken and rejected (vs. just incomplete).
+max_failure_pct = 1.0
+
 # Collection metadata key flipped to True only after a code index is fully
 # populated. A collection missing this marker (legacy) or carrying False (an
 # interrupted/partial index) is rebuilt rather than trusted on restart.
@@ -225,9 +229,8 @@ class IndexingMixin:
 
         total_functions = len(functions)
         failure_pct = (failed_count / total_functions * 100) if total_functions > 0 else 0
-        MAX_FAILURE_PCT = 1.0
 
-        if failure_pct > MAX_FAILURE_PCT:
+        if failure_pct > max_failure_pct:
             logger.error(
                 "Code index for '%s': %d/%d functions failed to decompile (%.1f%%). "
                 "Collection will NOT be marked complete and will be rebuilt on next startup.",

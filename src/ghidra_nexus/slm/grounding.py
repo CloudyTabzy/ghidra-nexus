@@ -110,7 +110,7 @@ _API_CATALOG: frozenset[str] = frozenset(
         "GetCurrentThread", "GetCurrentProcessId", "GetThreadId",
         "SuspendThread", "ResumeThread", "SetThreadPriority",
         "CreateMutex", "ReleaseMutex", "WaitForMultipleObjects",
-        "OpenProcess", "TerminateProcess",
+        "OpenProcess",
         # Registry
         "RegOpenKey", "RegOpenKeyEx", "RegCreateKey", "RegCreateKeyEx",
         "RegCloseKey", "RegQueryValueEx", "RegSetValueEx", "RegDeleteValue",

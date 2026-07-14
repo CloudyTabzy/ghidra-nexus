@@ -120,7 +120,7 @@ class XrefsExtractor:
                     entities.append(KeyEntity(kind="callee", value=fn))
             xref_types[x.get("type", "unknown")] += 1
 
-        type_str = ", ".join(f"{t}×{c}" for t, c in xref_types.most_common(6))
+        type_str = ", ".join(f"{t}x{c}" for t, c in xref_types.most_common(6))
         summary = f"{total} cross-references to {target}. Types: {type_str}."
         if functions:
             summary += f" Functions: {', '.join(sorted(functions)[:10])}."

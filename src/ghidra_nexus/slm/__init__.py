@@ -25,22 +25,19 @@ from ghidra_nexus.slm.tasks import (
 )
 
 __all__ = [
-    # Configuration / loader
+    "CallgraphExplanation",
+    "ExpandedQuery",
+    "NameCandidate",
     "SLMConfig",
+    "SuggestNameResult",
+    "SummarizeResult",
     "backend",
     "get_model",
     "is_available",
     "model_status",
-    "unload_model",
-    # Result dataclasses
-    "CallgraphExplanation",
-    "ExpandedQuery",
-    "NameCandidate",
-    "SuggestNameResult",
-    "SummarizeResult",
-    # Task runners
     "run_explain_callgraph",
     "run_query_expand",
     "run_suggest_name",
     "run_summarize",
+    "unload_model",
 ]

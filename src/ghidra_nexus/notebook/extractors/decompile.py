@@ -32,7 +32,7 @@ from ghidra_nexus.notebook.extractors.base import (
 
 # API-call-shaped tokens in C pseudo-code: ``Foo(...)`` or ``Foo::method``.
 # We only emit an entity when the callee is a *recognised* API name (uppercase
-# letter in the first 1–2 chars, length >= 3, no spaces). This is intentionally
+# letter in the first 1-2 chars, length >= 3, no spaces). This is intentionally
 # conservative — false positives hurt search more than missed calls.
 _API_RE = re.compile(r"\b([A-Z][A-Za-z0-9_]{2,})\s*\(")
 # Plain ``"..."`` string literal.
@@ -75,7 +75,8 @@ class DecompileExtractor:
 
     def extract(self, payload: dict[str, Any]) -> ExtractedView:
         name: str = payload.get("name") or "<unknown>"
-        rva: str | None = payload.get("addr") or payload.get("rva")
+        # The function's `addr` field is also used inline below; the
+        # previous `rva` alias was dead code (Phase 5 lint cleanup).
         code: str = payload.get("code") or ""
         signature: str | None = payload.get("signature")
         decompiler_status: str = payload.get("decompiler_status") or "decompiled"
@@ -220,7 +221,7 @@ class DecompileExtractor:
     ) -> str:
         """Compose a deterministic one-paragraph summary.
 
-        Target ~80–120 words. Never invent facts: only reference values that
+        Target ~80-120 words. Never invent facts: only reference values that
         were extracted from the input.
         """
         if quality == "empty":

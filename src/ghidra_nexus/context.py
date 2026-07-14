@@ -221,11 +221,12 @@ class PyGhidraContext(IndexingMixin):
 
             disposed = _threading.Event()
 
-            def _dispose():
+            # Capture by argument-default to avoid B023 (closure-over-loop-variable).
+            def _dispose(_pi=program_info, _done=disposed):
                 try:
-                    self._dispose_decompiler(program_info)
+                    self._dispose_decompiler(_pi)
                 finally:
-                    disposed.set()
+                    _done.set()
 
             t = _threading.Thread(target=_dispose, daemon=True)
             t.start()

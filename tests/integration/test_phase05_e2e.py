@@ -115,7 +115,7 @@ def test_section_health_classifies_find_exe(find_exe_path):
 
     data = find_exe_path.read_bytes()
     e = shannon_entropy(data[: 64 * 1024])
-    cls, rec, _ = classify_section(
+    cls, _rec, _ = classify_section(
         entropy=e, size_bytes=len(data), is_executable=True
     )
     assert cls.value in ("code", "compressed", "data")

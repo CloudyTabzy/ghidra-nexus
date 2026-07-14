@@ -506,14 +506,6 @@ class SurveyMetadata(BaseModel):
     sha256: str
 
 
-class SurveySegmentInfo(BaseModel):
-    name: str
-    start: str
-    end: str
-    size: str
-    permissions: str
-
-
 class SurveyEntrypoint(BaseModel):
     addr: str
     name: str

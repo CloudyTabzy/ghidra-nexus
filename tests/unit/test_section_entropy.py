@@ -60,7 +60,7 @@ class TestClassifySection:
         assert "encrypted" in reason.lower()
 
     def test_low_entropy_data_classified_data_with_skip(self):
-        cls, rec, reason = classify_section(
+        cls, rec, _reason = classify_section(
             entropy=3.5, size_bytes=4096, is_executable=False
         )
         assert cls is SectionClassification.DATA

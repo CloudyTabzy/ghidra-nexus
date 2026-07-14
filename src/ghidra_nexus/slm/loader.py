@@ -294,7 +294,7 @@ def _auto_select_onnx_file(model_id: str) -> str:
         "model.onnx",
     ]
     try:
-        from huggingface_hub import try_to_load_from_cache, get_hf_file_metadata
+        from huggingface_hub import get_hf_file_metadata, try_to_load_from_cache
 
         for fname in preferred:
             try:
