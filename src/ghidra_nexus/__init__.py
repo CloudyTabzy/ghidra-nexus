@@ -1,4 +1,4 @@
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 __author__ = "CloudyTabzy"
 __project__ = "GhidraNexus"
 __description__ = "Agent-first Ghidra MCP server with a persistent notebook."

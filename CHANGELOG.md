@@ -2,6 +2,26 @@
 
 All notable changes to **GhidraNexus** are documented in this file.
 
+## [0.5.0] — ABI correction + hook-stub generation
+
+### Added
+- **`override_callsite_signature`** (write) — the programmatic form of the
+  decompiler's "Override Signature" action: applies a corrected C prototype at
+  one call site via `HighFunctionDBUtil.writeOverride`, so re-decompilation
+  uses the right ABI. Read-back verified via the override marker symbol;
+  decompiler pool invalidated afterwards.
+- **`generate_hook_stub`** — emits a Zig or C fn-pointer stub from call-site
+  evidence (stack-slot offsets, ECX `this`, register-arg map) plus the
+  register-clobber lists from `verify_port`, with convention-mapped callconv
+  (`__thiscall` → `.thiscall`, `__cdecl` → `.C`, x64 → `.win64`). Types are
+  evidence-based guesses and the stub header says so.
+- Pure renderer module `ghidra_nexus.stub_gen` (JVM-free, fully unit-tested).
+
+### Tests
+- 27 new unit tests (`test_stub_gen.py`, `test_override_callsite.py`,
+  `test_generate_hook_stub.py`), including write-path (`write=True`) dispatch
+  verification for the override tool. Suite total: 529 passed, 1 skipped.
+
 ## [0.4.0] — Hook-porting fidelity
 
 ### Added

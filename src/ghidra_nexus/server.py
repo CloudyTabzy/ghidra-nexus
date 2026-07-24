@@ -124,6 +124,8 @@ def register_common_tools(server: FastMCP) -> None:
     server.tool()(mcp_tools.disassemble)
     server.tool()(mcp_tools.disassemble_call_site)
     server.tool()(mcp_tools.verify_port)
+    server.tool()(mcp_tools.override_callsite_signature)
+    server.tool()(mcp_tools.generate_hook_stub)
     server.tool()(mcp_tools.gen_callgraph)
     server.tool()(mcp_tools.analysis_status)
     server.tool()(mcp_tools.import_binary)

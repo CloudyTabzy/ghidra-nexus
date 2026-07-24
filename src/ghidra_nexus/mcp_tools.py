@@ -50,6 +50,7 @@ from ghidra_nexus.models import (
     CallGraphResult,
     CallSiteAnalysisResult,
     CallSiteInfo,
+    CallsiteOverrideResult,
     CodeSearchResult,
     CodeSearchResults,
     CommentResponse,
@@ -60,6 +61,7 @@ from ghidra_nexus.models import (
     FunctionPrototypeResponse,
     GotoResponse,
     GuiContextResponse,
+    HookStubResult,
     ImportInfos,
     ImportRequestResult,
     OpenProgramInfo,
@@ -1401,6 +1403,79 @@ def _signature_hash(signature: str) -> str:
 
 
 @mcp_error_handler
+async def override_callsite_signature(
+    binary_name: str,
+    ctx: Context,
+    function: str,
+    call_site: str,
+    signature: str,
+) -> CallsiteOverrideResult:
+    """Override the prototype used at ONE call site (write operation).
+
+    The programmatic form of the decompiler's "Override Signature" action:
+    Ghidra re-decompiles the containing function with ``signature`` applied
+    at the call instruction at ``call_site``. Use after
+    ``disassemble_call_site`` shows a non-standard convention and
+    ``verify_port`` confirms the corrected one. The result's ``verified``
+    flag confirms the override marker was read back from the program.
+    """
+    if not signature or not signature.strip():
+        raise _ToolRecoverable(
+            ToolErrorCode.INVALID_PARAMS,
+            "signature must be a non-empty C-style prototype, "
+            "e.g. 'int __thiscall Lock(void *this, int flags)'",
+            binary_name=binary_name,
+            addr=call_site,
+        )
+    _pyghidra_context, program_info = _require_program(ctx, binary_name, require_analysis=True)
+
+    tools = GhidraTools(program_info)
+
+    def _run():
+        return tools.override_callsite_signature(
+            function, call_site, signature, binary_name=binary_name
+        )
+
+    return await get_executor().submit(
+        program_info,
+        _run,
+        write=True,
+        task_id=f"override_callsite_signature:{binary_name}:{call_site}",
+    )
+
+
+@mcp_error_handler
+async def generate_hook_stub(
+    binary_name: str,
+    ctx: Context,
+    target: str,
+    language: str = "zig",
+    call_site: str | None = None,
+) -> HookStubResult:
+    """Generate a Zig/C hook stub from call-site or function evidence.
+
+    ``target`` is a function name or address. With ``call_site`` set, the
+    stub is built from that call's stack evidence (push order, slot
+    offsets, ECX `this`, register clobbers); without it, from the
+    function's declared prototype. Types from call-site evidence are
+    pointer-vs-word guesses — run ``verify_port`` first and refine types
+    against the decompilation. Read-only.
+    """
+    _pyghidra_context, program_info = _require_program(ctx, binary_name, require_analysis=True)
+
+    tools = GhidraTools(program_info)
+
+    def _run():
+        return tools.generate_hook_stub(
+            target, language=language, call_site=call_site, binary_name=binary_name
+        )
+
+    return await get_executor().submit(
+        program_info, _run, task_id=f"generate_hook_stub:{binary_name}:{target}"
+    )
+
+
+@mcp_error_handler
 async def gen_callgraph(
     binary_name: str,
     function_name: str,
@@ -2323,6 +2398,8 @@ def _register_all_on_demand(mcp_server):
         (disassemble, "disassemble"),
         (disassemble_call_site, "disassemble_call_site"),
         (verify_port, "verify_port"),
+        (override_callsite_signature, "override_callsite_signature"),
+        (generate_hook_stub, "generate_hook_stub"),
         (gen_callgraph, "gen_callgraph"),
         (section_health, "section_health"),
         (analysis_status, "analysis_status"),

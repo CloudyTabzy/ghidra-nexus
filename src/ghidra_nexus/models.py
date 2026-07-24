@@ -606,6 +606,38 @@ class VerifyPortResult(BaseModel):
     )
 
 
+class CallsiteOverrideResult(BaseModel):
+    """Result of overriding the prototype at a single call site."""
+
+    function_name: str
+    function_address: str
+    call_site: str
+    applied_signature: str
+    binary_name: str = ""
+    verified: bool = Field(
+        ...,
+        description=(
+            "True when the override marker was read back from the program "
+            "after applying. False means the write may not have taken effect."
+        ),
+    )
+
+
+class HookStubResult(BaseModel):
+    """Generated Zig/C hook stub with the evidence behind it."""
+
+    target: str
+    language: str = Field(..., description="'zig' or 'c'.")
+    convention: str = Field(
+        ..., description="Normalized convention used in the stub (cdecl/stdcall/thiscall/...)."
+    )
+    stub: str = Field(..., description="Ready-to-adapt stub source text.")
+    clobbered_volatile: list[str] = Field(default_factory=list)
+    clobbered_non_volatile: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    binary_name: str = ""
+
+
 class CallGraphDirection(str, Enum):
     """Represents the direction of the call graph."""
 

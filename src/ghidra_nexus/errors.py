@@ -121,6 +121,8 @@ REGISTERED_TOOL_NAMES: frozenset[str] = frozenset(
         "disassemble",
         "disassemble_call_site",
         "verify_port",
+        "override_callsite_signature",
+        "generate_hook_stub",
         "gen_callgraph",
         "analysis_status",
         "import_binary",

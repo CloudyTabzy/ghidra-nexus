@@ -1,6 +1,6 @@
 [project]
 name = "ghidra-nexus"
-version = "0.4.0"
+version = "0.5.0"
 description = "Agent-first Ghidra MCP server with a persistent notebook — built for long-horizon reverse engineering"
 readme = "README.md"
 requires-python = ">=3.10"

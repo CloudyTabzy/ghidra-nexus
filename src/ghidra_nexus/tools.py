@@ -19,12 +19,14 @@ from ghidra_nexus.models import (
     CallGraphResult,
     CallSiteAnalysisResult,
     CallSiteInfo,
+    CallsiteOverrideResult,
     CodeSearchResult,
     CodeSearchResults,
     CrossReferenceInfo,
     DecompiledFunction,
     DisassembleResult,
     ExportInfo,
+    HookStubResult,
     ImportInfo,
     SearchMode,
     SectionHealth,
@@ -1315,6 +1317,217 @@ class GhidraTools:
         return classify_registers(
             written, pushed_prologue & popped, self._pointer_size()
         )
+
+    @handle_exceptions
+    def override_callsite_signature(
+        self,
+        function_name_or_address: str,
+        call_site: str,
+        signature: str,
+        binary_name: str = "",
+    ) -> "CallsiteOverrideResult":
+        """Override the prototype used at ONE call site (write operation).
+
+        This is the programmatic form of the decompiler's "Override
+        Signature" action: after running, Ghidra re-decompiles the
+        containing function with the given prototype at that call, which is
+        how a corrected ABI propagates into pseudocode. Verified by reading
+        back the override marker symbol afterwards.
+        """
+        from ghidra.app.util.parser import FunctionSignatureParser
+        from ghidra.program.model.pcode import HighFunction, HighFunctionDBUtil
+
+        func = self.find_function(function_name_or_address)
+        function_name = str(func.getName())
+        addr = self._parse_address(call_site)
+
+        if not func.getBody().contains(addr):
+            raise ValueError(
+                f"Address {call_site} is not inside function '{function_name}'."
+            )
+        insn = self.program.getListing().getInstructionAt(addr)
+        if insn is None or not insn.getFlowType().isCall():
+            raise ValueError(
+                f"No call instruction found at {addr} in function '{function_name}'."
+            )
+
+        parser = FunctionSignatureParser(
+            self.program.getDataTypeManager(), typing.cast(typing.Any, None)
+        )
+        try:
+            parsed = parser.parse(func.getSignature(False), signature)
+        except Exception as e:
+            raise ValueError(f"Could not parse signature '{signature}': {e}") from e
+        if parsed is None:
+            raise ValueError(f"Could not parse signature '{signature}'")
+
+        with ghidra_transaction(
+            self.program, f"nexus: override call signature @ {addr}"
+        ):
+            HighFunctionDBUtil.writeOverride(func, addr, parsed)
+
+        self.invalidate_decompiler_cache()
+        return CallsiteOverrideResult(
+            function_name=function_name,
+            function_address=str(func.getEntryPoint()),
+            call_site=str(addr),
+            applied_signature=str(parsed),
+            binary_name=binary_name,
+            verified=self._read_back_callsite_override(func, addr, HighFunction),
+        )
+
+    def _read_back_callsite_override(
+        self, func: "Function", addr, high_function_cls
+    ) -> bool:
+        """Confirm an override marker (``prt*`` label in the override space)."""
+        try:
+            space = high_function_cls.findOverrideSpace(func)
+            if space is None:
+                return False
+            for sym in self.program.getSymbolTable().getSymbols(addr):
+                if sym.getParentNamespace() == space and str(sym.getName()).startswith(
+                    "prt"
+                ):
+                    return True
+        except Exception:
+            logger.debug("override read-back failed @ %s", addr, exc_info=True)
+        return False
+
+    @handle_exceptions
+    def generate_hook_stub(
+        self,
+        name_or_address: str,
+        language: str = "zig",
+        call_site: str | None = None,
+        binary_name: str = "",
+    ) -> "HookStubResult":
+        """Generate a Zig/C hook stub from call-site or function evidence.
+
+        Call-site mode uses the stack evidence from
+        :meth:`analyze_call_sites`; function mode uses the declared
+        prototype. Types in call-site mode are evidence-based guesses
+        (pointer vs word) — the stub header says so.
+        """
+        from ghidra_nexus.stub_gen import (
+            StubSpec,
+            normalize_convention,
+            render_hook_stub,
+        )
+
+        language = language.lower()
+        if language not in ("zig", "c"):
+            raise ValueError(
+                f"Unsupported language '{language}' (expected 'zig' or 'c')"
+            )
+
+        func = self.find_function(name_or_address)
+        ptr = self._pointer_size()
+        clobbers = self._register_clobbers(func)
+        warnings: list[str] = []
+
+        if call_site is not None:
+            site_addr = str(self._parse_address(call_site))
+            sites = self.analyze_call_sites(
+                str(func.getEntryPoint()), binary_name=binary_name
+            ).call_sites
+            site = next((s for s in sites if s.address == site_addr), None)
+            if site is None:
+                raise ValueError(
+                    f"No call instruction found at {site_addr} in function "
+                    f"'{func.getName()}'."
+                )
+            conv_label = site.callee_convention or site.inferred_convention or ""
+            convention = normalize_convention(conv_label, ptr)
+            args = self._stub_args_from_site(site, language, ptr)
+            address = site_addr
+            return_type = None
+            warnings.extend(site.warnings)
+            if site.confidence != "high":
+                warnings.append(
+                    f"convention confidence is {site.confidence}; "
+                    "confirm with verify_port before patching"
+                )
+        else:
+            conv_label = None
+            try:
+                conv_label = func.getCallingConventionName()
+            except Exception:
+                conv_label = None
+            convention = normalize_convention(conv_label, ptr)
+            args = self._stub_args_from_function(func, language, ptr)
+            address = str(func.getEntryPoint())
+            try:
+                return_type = str(func.getReturnType().getDisplayName())
+            except Exception:
+                return_type = None
+
+        spec = StubSpec(
+            target_name=str(func.getName()),
+            address=address,
+            language=language,
+            convention=convention,
+            convention_label=conv_label or "",
+            args=args,
+            return_type=return_type,
+            clobbered_volatile=clobbers.get("clobbered_volatile", []),
+            clobbered_non_volatile=clobbers.get("clobbered_non_volatile", []),
+            warnings=warnings,
+        )
+        return HookStubResult(
+            target=name_or_address,
+            language=language,
+            convention=convention,
+            stub=render_hook_stub(spec),
+            clobbered_volatile=spec.clobbered_volatile,
+            clobbered_non_volatile=spec.clobbered_non_volatile,
+            warnings=warnings,
+            binary_name=binary_name,
+        )
+
+    def _stub_args_from_site(self, site, language: str, ptr: int) -> list:
+        from ghidra_nexus.stub_gen import StubArg, arg_type_from_evidence
+
+        args: list = []
+        conv = (site.callee_convention or site.inferred_convention or "").lower()
+        if "thiscall" in conv:
+            note = f"ecx <- {site.ecx_source}" if site.ecx_source else "ecx (this)"
+            ptr_type = "*anyopaque" if language == "zig" else "void *"
+            args.append(StubArg(name="this", type_text=ptr_type, note=note))
+        for i, w in enumerate(site.stack_args):
+            note = f"[sp+0x{w.slot_offset:02x}] <- {w.source}"
+            args.append(
+                StubArg(
+                    name=f"arg{i + 1}",
+                    type_text=arg_type_from_evidence(w.resolved_source, language, ptr),
+                    note=note,
+                )
+            )
+        for reg, src in site.register_args.items():
+            args.append(
+                StubArg(
+                    name=f"arg_{reg}",
+                    type_text=arg_type_from_evidence(None, language, ptr),
+                    note=f"{reg} <- {src}",
+                )
+            )
+        return args
+
+    def _stub_args_from_function(self, func: "Function", language: str, ptr: int) -> list:
+        from ghidra_nexus.stub_gen import StubArg, arg_type_from_evidence
+
+        args: list = []
+        try:
+            params = list(func.getParameters())
+        except Exception:
+            params = []
+        for i, param in enumerate(params):
+            try:
+                type_text = str(param.getDataType().getDisplayName())
+            except Exception:
+                type_text = arg_type_from_evidence(None, language, ptr)
+            name = str(param.getName()) or f"arg{i + 1}"
+            args.append(StubArg(name=name, type_text=type_text, note=""))
+        return args
 
     @staticmethod
     def _norm_conv(conv: str | None) -> str:
