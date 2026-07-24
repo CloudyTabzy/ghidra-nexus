@@ -37,6 +37,7 @@ DEFAULT_LIMITS: dict[str, int] = {
     "functions": 100,
     "fts": 20,
     "breadcrumbs": 50,
+    "call_sites": 20,
 }
 
 MAX_LIMITS: dict[str, int] = {
@@ -47,6 +48,7 @@ MAX_LIMITS: dict[str, int] = {
     "functions": 1_000,
     "fts": 100,
     "breadcrumbs": 500,
+    "call_sites": 500,
 }
 
 

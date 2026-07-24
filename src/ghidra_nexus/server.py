@@ -122,6 +122,8 @@ def register_common_tools(server: FastMCP) -> None:
     server.tool()(mcp_tools.search_strings)
     server.tool()(mcp_tools.read_bytes)
     server.tool()(mcp_tools.disassemble)
+    server.tool()(mcp_tools.disassemble_call_site)
+    server.tool()(mcp_tools.verify_port)
     server.tool()(mcp_tools.gen_callgraph)
     server.tool()(mcp_tools.analysis_status)
     server.tool()(mcp_tools.import_binary)
@@ -569,7 +571,7 @@ def main(
     mcp.settings.host = host
 
     if transport in ("streamable-http", "http", "sse") and not gui:
-        _register_lazy_tools(mcp)
+        mcp_tools._register_lazy_tools(mcp)
     else:
         register_common_tools(mcp)
 

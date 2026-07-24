@@ -12,6 +12,7 @@ from .base import (
 )
 from .decompile import DecompileExtractor
 from .families import (
+    CallSitesExtractor,
     DisasmExtractor,
     SectionHealthExtractor,
     StringsExtractor,
@@ -19,6 +20,7 @@ from .families import (
 )
 
 __all__ = [
+    "CallSitesExtractor",
     "DecompileExtractor",
     "DisasmExtractor",
     "ExtractedView",

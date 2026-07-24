@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 
 MIGRATIONS_DIR = Path(__file__).parent / "_migrations"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 
 @dataclass
@@ -105,6 +105,8 @@ class Notebook:
         self.functions = tables.FunctionsManager(self)
         self.decompiles = tables.DecompilesManager(self)
         self.disassemblies = tables.DisassembliesManager(self)
+        self.call_sites = tables.CallSitesManager(self)
+        self.port_verifications = tables.PortVerificationsManager(self)
         self.xrefs = tables.XrefsManager(self)
         self.strings = tables.StringsManager(self)
         self.breadcrumbs = tables.BreadcrumbsManager(self)

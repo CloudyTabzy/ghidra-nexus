@@ -119,6 +119,8 @@ REGISTERED_TOOL_NAMES: frozenset[str] = frozenset(
         "search_strings",
         "read_bytes",
         "disassemble",
+        "disassemble_call_site",
+        "verify_port",
         "gen_callgraph",
         "analysis_status",
         "import_binary",

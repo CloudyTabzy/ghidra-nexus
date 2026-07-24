@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import gzip
 import json
+import logging
+import sqlite3
 import time
 from typing import TYPE_CHECKING
 
@@ -16,9 +18,9 @@ from ghidra_nexus.notebook.pagination import clamp_limit, validate_offset, windo
 from ghidra_nexus.notebook.scale import classify_binary
 
 if TYPE_CHECKING:
-    import sqlite3
-
     from ghidra_nexus.notebook.store import Notebook
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -35,6 +37,19 @@ def _gz_decompress(blob: bytes) -> str:
 
 def _json_serialize(obj: object) -> str:
     return json.dumps(obj, ensure_ascii=False, default=str)
+
+
+def _fts_index(
+    nb: Notebook, *, kind: str, binary_id: int, rva: str, name: str, body: str
+) -> None:
+    """Best-effort FTS indexing for knowledge-plane writes.
+
+    Never raises — a search-index failure must not fail the underlying write.
+    """
+    try:
+        nb.search.upsert(kind=kind, binary_id=binary_id, rva=rva, name=name, body=body)
+    except Exception:
+        logger.warning("FTS indexing failed for %s @ %s", kind, rva, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +413,154 @@ class DisassembliesManager:
 
 
 # ---------------------------------------------------------------------------
+# call_sites
+# ---------------------------------------------------------------------------
+
+class CallSitesManager:
+    __slots__ = ("nb",)
+
+    def __init__(self, nb: Notebook):
+        self.nb = nb
+
+    def put(
+        self,
+        *,
+        binary_id: int,
+        rva: str,
+        payload: str,
+        site_count: int,
+        analysis_generation: int = 0,
+    ) -> int:
+        blob = _gz_compress(payload)
+        with self.nb.transaction() as conn:
+            conn.execute(
+                """INSERT INTO call_sites (binary_id, rva, payload, site_count, analysis_generation)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (binary_id, rva, blob, site_count, analysis_generation),
+            )
+            row = conn.execute("SELECT last_insert_rowid()").fetchone()
+        return int(row[0]) if row else 0
+
+    def get(self, binary_id: int, rva: str) -> dict | None:
+        row = self.nb.conn.execute(
+            """SELECT * FROM call_sites WHERE binary_id = ? AND rva = ?
+               ORDER BY analysis_generation DESC LIMIT 1""",
+            (binary_id, rva),
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        try:
+            result["payload_text"] = _gz_decompress(result["payload"])
+        except Exception:
+            result["payload_text"] = ""
+        return result
+
+    def count_for_binary(self, binary_id: int) -> int:
+        row = self.nb.conn.execute(
+            "SELECT COUNT(*) FROM call_sites WHERE binary_id = ?", (binary_id,)
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def delete_old_generations(self, binary_id: int, keep_generations: int = 2) -> int:
+        """Delete call-site rows whose generation is older than the newest N."""
+        if keep_generations < 1:
+            keep_generations = 1
+        with self.nb.transaction() as conn:
+            before = conn.total_changes
+            conn.execute(
+                """DELETE FROM call_sites
+                   WHERE binary_id = ?
+                     AND analysis_generation < (
+                         SELECT MIN(analysis_generation) FROM (
+                             SELECT DISTINCT analysis_generation FROM call_sites
+                             WHERE binary_id = ? ORDER BY analysis_generation DESC LIMIT ?
+                         )
+                     )""",
+                (binary_id, binary_id, keep_generations),
+            )
+            return conn.total_changes - before
+
+
+# ---------------------------------------------------------------------------
+# port_verifications
+# ---------------------------------------------------------------------------
+
+class PortVerificationsManager:
+    __slots__ = ("nb",)
+
+    def __init__(self, nb: Notebook):
+        self.nb = nb
+
+    def put(
+        self,
+        *,
+        binary_id: int,
+        rva: str,
+        signature: str,
+        signature_hash: str,
+        verdict: str,
+        checks: list[dict],
+        warnings: list[str] | None = None,
+        call_site_rva: str | None = None,
+        analysis_generation: int = 0,
+    ) -> int:
+        with self.nb.transaction() as conn:
+            conn.execute(
+                """INSERT INTO port_verifications
+                   (binary_id, rva, call_site_rva, signature, signature_hash,
+                    verdict, checks_json, warnings_json, analysis_generation)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    binary_id,
+                    rva,
+                    call_site_rva,
+                    signature,
+                    signature_hash,
+                    verdict,
+                    _json_serialize(checks),
+                    _json_serialize(warnings) if warnings else None,
+                    analysis_generation,
+                ),
+            )
+            row = conn.execute("SELECT last_insert_rowid()").fetchone()
+        check_names = " ".join(str(c.get("name", "")) for c in checks if isinstance(c, dict))
+        _fts_index(
+            self.nb,
+            kind="port_verification",
+            binary_id=binary_id,
+            rva=rva,
+            name=f"verify:{rva}",
+            body=f"{signature} verdict={verdict} {check_names}",
+        )
+        return int(row[0]) if row else 0
+
+    def latest_for(self, binary_id: int, rva: str) -> dict | None:
+        row = self.nb.conn.execute(
+            """SELECT * FROM port_verifications WHERE binary_id = ? AND rva = ?
+               ORDER BY created_at DESC, id DESC LIMIT 1""",
+            (binary_id, rva),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_for(self, binary_id: int, *, offset: int = 0, limit: int = 50) -> dict:
+        limit = clamp_limit("breadcrumbs", limit)
+        offset = validate_offset("breadcrumbs", offset)
+        rows = self.nb.conn.execute(
+            """SELECT * FROM port_verifications WHERE binary_id = ?
+               ORDER BY created_at DESC, id DESC""",
+            (binary_id,),
+        ).fetchall()
+        return window_list([dict(r) for r in rows], offset=offset, limit=limit)
+
+    def count_for_binary(self, binary_id: int) -> int:
+        row = self.nb.conn.execute(
+            "SELECT COUNT(*) FROM port_verifications WHERE binary_id = ?", (binary_id,)
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+
+# ---------------------------------------------------------------------------
 # xrefs
 # ---------------------------------------------------------------------------
 
@@ -503,7 +666,19 @@ class BreadcrumbsManager:
                 (binary_id, session_id, tool, args_hash, summary[:256], rva, duration_ms, 1 if truncated else 0, error_code),
             )
             row = conn.execute("SELECT last_insert_rowid()").fetchone()
-        return int(row[0]) if row else 0
+        row_id = int(row[0]) if row else 0
+        # Only failures are recall-worthy: full breadcrumb indexing would
+        # flood FTS with near-identical auto-generated rows.
+        if error_code:
+            _fts_index(
+                self.nb,
+                kind="breadcrumb_error",
+                binary_id=binary_id or 0,
+                rva=rva or "",
+                name=tool,
+                body=f"{tool} failed with {error_code}: {summary[:256]}",
+            )
+        return row_id
 
     def recent(
         self,
@@ -608,6 +783,8 @@ class AliasesManager:
                    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
                 (binary_id, rva, name, _json_serialize(tags) if tags else None, status, confidence, notes),
             )
+        body = " ".join([name, *(tags or []), notes or ""])
+        _fts_index(self.nb, kind="alias", binary_id=binary_id, rva=rva, name=name, body=body)
 
     def get(self, binary_id: int, rva: str) -> dict | None:
         row = self.nb.conn.execute(
@@ -650,7 +827,16 @@ class HypothesesManager:
                 (binary_id, text, status, _json_serialize(evidence_for) if evidence_for else None, _json_serialize(evidence_against) if evidence_against else None),
             )
             row = conn.execute("SELECT last_insert_rowid()").fetchone()
-        return int(row[0]) if row else 0
+        hid = int(row[0]) if row else 0
+        _fts_index(
+            self.nb,
+            kind="hypothesis",
+            binary_id=binary_id or 0,
+            rva="",
+            name=f"hypothesis:{hid}",
+            body=f"{status}: {text}",
+        )
+        return hid
 
     def update(self, id_: int, **fields) -> None:
         sets = ", ".join(f"{k} = ?" for k in fields)
@@ -660,6 +846,16 @@ class HypothesesManager:
             conn.execute(
                 f"UPDATE hypotheses SET {sets}, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 values,
+            )
+        row = self.get(id_)
+        if row is not None:
+            _fts_index(
+                self.nb,
+                kind="hypothesis",
+                binary_id=row.get("binary_id") or 0,
+                rva="",
+                name=f"hypothesis:{id_}",
+                body=f"{row.get('status', 'open')}: {row.get('text', '')}",
             )
 
     def list(self, *, binary_id: int | None = None, status: str | None = None) -> list[dict]:

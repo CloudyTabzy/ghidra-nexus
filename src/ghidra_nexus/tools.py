@@ -17,6 +17,8 @@ from ghidra_nexus.models import (
     CallGraphDirection,
     CallGraphDisplayType,
     CallGraphResult,
+    CallSiteAnalysisResult,
+    CallSiteInfo,
     CodeSearchResult,
     CodeSearchResults,
     CrossReferenceInfo,
@@ -30,6 +32,8 @@ from ghidra_nexus.models import (
     StringSearchResult,
     SurveyBinaryResult,
     SymbolInfo,
+    VerifyPortCheck,
+    VerifyPortResult,
 )
 from ghidra_nexus.section_entropy import classify_section, shannon_entropy
 
@@ -1087,6 +1091,586 @@ class GhidraTools:
                 parts.append(operands)
             lines.append(" ".join(parts))
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Hook-porting fidelity: call-site stack analysis + port verification
+    # ------------------------------------------------------------------
+
+    def _pointer_size(self) -> int:
+        size_bits = self.program.getAddressFactory().getDefaultAddressSpace().getSize()
+        return max(4, int(size_bits) // 8)
+
+    @staticmethod
+    def _operand_reprs(insn) -> list[str]:
+        operands = []
+        for i in range(insn.getNumOperands()):
+            rep = insn.getDefaultOperandRepresentation(i)
+            if rep:
+                operands.append(str(rep))
+        return operands
+
+    @staticmethod
+    def _note_jump_target(insn, flow, body, jump_targets: set[str]) -> None:
+        if not flow.isJump():
+            return
+        for ref in insn.getReferencesFrom():
+            to = ref.getToAddress()
+            if to is not None and body.contains(to):
+                jump_targets.add(str(to))
+
+    @staticmethod
+    def _resolve_call_target(insn, fm) -> tuple:
+        """Resolve a direct-call target to (name, address, convention, params)."""
+        for ref in insn.getReferencesFrom():
+            try:
+                if not ref.getReferenceType().isCall():
+                    continue
+            except Exception:
+                continue
+            callee = fm.getFunctionAt(ref.getToAddress())
+            if callee is None:
+                continue
+            if callee.isThunk():
+                thunked = callee.getThunkedFunction(False)
+                if thunked is not None:
+                    callee = thunked
+            try:
+                convention = callee.getCallingConventionName()
+            except Exception:
+                convention = None
+            try:
+                param_count = int(callee.getParameterCount())
+            except Exception:
+                param_count = None
+            return str(callee.getName()), str(ref.getToAddress()), convention, param_count
+        return None, None, None, None
+
+    def _collect_insn_records(self, func: "Function") -> tuple[list, set[str]]:
+        """Linearize a function body into analyzer-ready instruction records.
+
+        Returns (records, jump_targets). Records are
+        :class:`callsite_analysis.InsnRecord`; jump_targets holds the string
+        addresses inside the body that are branch destinations.
+        """
+        from ghidra_nexus.callsite_analysis import InsnRecord
+
+        listing = self.program.getListing()
+        fm = self.program.getFunctionManager()
+        body = func.getBody()
+
+        records: list = []
+        jump_targets: set[str] = []
+        for insn in listing.getInstructions(body, True):
+            flow = insn.getFlowType()
+            is_call = bool(flow.isCall())
+            self._note_jump_target(insn, flow, body, jump_targets)
+
+            target_name = target_address = callee_convention = None
+            callee_param_count = None
+            if is_call:
+                (
+                    target_name,
+                    target_address,
+                    callee_convention,
+                    callee_param_count,
+                ) = self._resolve_call_target(insn, fm)
+
+            records.append(
+                InsnRecord(
+                    address=str(insn.getAddress()),
+                    mnemonic=str(insn.getMnemonicString()),
+                    operands=self._operand_reprs(insn),
+                    is_call=is_call,
+                    is_ret=bool(flow.isTerminal()),
+                    is_unconditional_jump=bool(flow.isJump() and flow.isUnConditional()),
+                    is_indirect_call=is_call and target_address is None,
+                    target_name=target_name,
+                    target_address=target_address,
+                    callee_convention=callee_convention,
+                    callee_param_count=callee_param_count,
+                )
+            )
+        return records, jump_targets
+
+    @handle_exceptions
+    def analyze_call_sites(
+        self,
+        name_or_address: str,
+        max_scan: int = 40,
+        binary_name: str = "",
+    ) -> "CallSiteAnalysisResult":
+        """Reconstruct stack-argument evidence for every CALL in a function.
+
+        For each call site, walks backwards collecting PUSH / MOV [sp+X]
+        writes, resolves one level of register indirection, and infers the
+        calling convention with an explicit confidence level. Designed for
+        hook porting, where decompiler pseudocode can hide a non-standard
+        push order.
+        """
+        from ghidra_nexus.callsite_analysis import analyze_call_sites as _analyze
+
+        func = self.find_function(name_or_address)
+        records, jump_targets = self._collect_insn_records(func)
+        sites = _analyze(
+            records,
+            pointer_size=self._pointer_size(),
+            max_scan=max_scan,
+            jump_targets=frozenset(jump_targets),
+        )
+        self._apply_pcode_fallback(func, sites)
+        return CallSiteAnalysisResult(
+            function_name=str(func.getName()),
+            function_address=str(func.getEntryPoint()),
+            binary_name=binary_name,
+            call_sites=[CallSiteInfo(**s.to_dict()) for s in sites],
+            total_call_sites=len(sites),
+        )
+
+    def _apply_pcode_fallback(self, func: "Function", sites: list) -> None:
+        """Cross-check low-evidence indirect call sites against decompiler P-code.
+
+        At most one decompile per call. Any failure degrades silently to
+        listing-only evidence — the fallback is a cross-check, never required.
+        """
+        from ghidra_nexus.callsite_analysis import (
+            apply_pcode_arg_count,
+            needs_pcode_fallback,
+        )
+
+        flagged = [s for s in sites if needs_pcode_fallback(s)]
+        if not flagged:
+            return
+        try:
+            from ghidra.program.model.pcode import PcodeOp
+            from ghidra.util.task import ConsoleTaskMonitor
+        except Exception:
+            logger.debug("p-code fallback unavailable", exc_info=True)
+            return
+        try:
+            with self.decompiler_pool.acquire() as decompiler:
+                results = decompiler.decompileFunction(func, 30, ConsoleTaskMonitor())
+                if results is None or not results.decompileCompleted():
+                    logger.debug(
+                        "p-code fallback: decompile incomplete for %s", func.getName()
+                    )
+                    return
+                high = results.getHighFunction()
+                if high is None:
+                    return
+                for site in flagged:
+                    addr = self._parse_address(site.address)
+                    count = self._pcode_call_arg_count(high, addr, PcodeOp)
+                    if count is not None:
+                        apply_pcode_arg_count(site, count)
+        except Exception:
+            logger.debug("p-code fallback failed for %s", func.getName(), exc_info=True)
+
+    @staticmethod
+    def _pcode_call_arg_count(high, addr, pcode_op_cls) -> int | None:
+        """Argument count of the CALL/CALLIND P-code op at ``addr`` (inputs - 1)."""
+        ops = high.getPcodeOps(addr)
+        while ops.hasNext():
+            op = ops.next()
+            if op.getOpcode() in (pcode_op_cls.CALL, pcode_op_cls.CALLIND):
+                return max(0, int(op.getNumInputs()) - 1)
+        return None
+
+    def _register_clobbers(self, func: "Function") -> dict:
+        """Conservative register-write scan for hook planning.
+
+        Collects every register written in the body (via result objects),
+        then classifies them into saved (pushed in the prologue and popped
+        before returning) vs clobbered, split by ABI volatility.
+        """
+        from ghidra.program.model.lang import Register
+
+        from ghidra_nexus.callsite_analysis import classify_registers
+
+        listing = self.program.getListing()
+        written: set[str] = set()
+        pushed_prologue: set[str] = set()
+        popped: set[str] = set()
+        seen_call = False
+        for insn in listing.getInstructions(func.getBody(), True):
+            flow = insn.getFlowType()
+            for obj in insn.getResultObjects():
+                if isinstance(obj, Register):
+                    written.add(str(obj.getBaseRegister().getName()).lower())
+            mnem = str(insn.getMnemonicString()).lower()
+            if mnem not in ("push", "pop") or insn.getNumOperands() == 0:
+                if flow.isCall():
+                    seen_call = True
+                continue
+            rep = insn.getDefaultOperandRepresentation(0)
+            if not rep:
+                continue
+            reg = str(rep).lower()
+            if mnem == "push":
+                if not seen_call:
+                    pushed_prologue.add(reg)
+            else:
+                popped.add(reg)
+            if flow.isCall():
+                seen_call = True
+        return classify_registers(
+            written, pushed_prologue & popped, self._pointer_size()
+        )
+
+    @staticmethod
+    def _norm_conv(conv: str | None) -> str:
+        return (conv or "").lower().lstrip("_").replace(" ", "")
+
+    @staticmethod
+    def _reg_arg_count(calling_convention: str) -> int:
+        """Register-passed argument count implied by a convention (x86-32)."""
+        conv = (calling_convention or "").lower()
+        if "thiscall" in conv:
+            return 1  # ecx
+        if "fastcall" in conv:
+            return 2  # ecx, edx
+        return 0
+
+    def _expected_stack_param_bytes(
+        self, calling_convention: str, arg_lengths: list[int], ptr: int
+    ) -> int:
+        """Bytes of stack-passed parameters implied by a convention."""
+        reg_args = self._reg_arg_count(calling_convention)
+        stack_lengths = arg_lengths[reg_args:] if len(arg_lengths) > reg_args else []
+        slots = [((length + ptr - 1) // ptr) * ptr for length in stack_lengths]
+        return sum(slots)
+
+    @staticmethod
+    def _add_check(
+        checks: list[VerifyPortCheck],
+        name: str,
+        expected: object,
+        actual: object,
+        status: str,
+    ) -> None:
+        checks.append(
+            VerifyPortCheck(
+                name=name,
+                expected=str(expected),
+                actual=str(actual),
+                status=status,
+            )
+        )
+
+    def _parse_proposed_signature(
+        self, func: "Function", signature: str, ptr: int
+    ) -> tuple[str, list[int]]:
+        """Parse a proposed C prototype. Returns (convention, arg lengths)."""
+        from ghidra.app.util.parser import FunctionSignatureParser
+
+        parser = FunctionSignatureParser(
+            self.program.getDataTypeManager(), typing.cast(typing.Any, None)
+        )
+        try:
+            parsed = parser.parse(func.getSignature(False), signature)
+        except Exception as e:
+            raise ValueError(f"Could not parse signature '{signature}': {e}") from e
+        if parsed is None:
+            raise ValueError(f"Could not parse signature '{signature}'")
+
+        conv = str(parsed.getCallingConventionName() or "")
+        lengths: list[int] = []
+        for arg in parsed.getArguments():
+            try:
+                lengths.append(max(1, int(arg.getDataType().getLength())))
+            except Exception:
+                lengths.append(ptr)
+        return conv, lengths
+
+    @handle_exceptions
+    def verify_port(
+        self,
+        name_or_address: str,
+        signature: str,
+        call_site: str | None = None,
+        binary_name: str = "",
+    ) -> "VerifyPortResult":
+        """Pre-flight check of a proposed ported signature against binary evidence.
+
+        Compares calling convention, parameter count, and stack-parameter
+        byte count (from ``ret N`` epilogues or call-site push evidence)
+        between the proposed C-style signature and what the binary actually
+        does. Read-only: parses the signature but never applies it.
+        """
+        func = self.find_function(name_or_address)
+        ptr = self._pointer_size()
+        proposed_conv, proposed_arg_lengths = self._parse_proposed_signature(
+            func, signature, ptr
+        )
+        clobbers = self._register_clobbers(func)
+        if call_site is not None:
+            return self._verify_port_at_call_site(
+                func,
+                name_or_address,
+                signature,
+                call_site,
+                proposed_conv,
+                len(proposed_arg_lengths),
+                binary_name,
+                clobbers,
+            )
+        return self._verify_port_at_function(
+            func,
+            name_or_address,
+            signature,
+            proposed_conv,
+            proposed_arg_lengths,
+            ptr,
+            binary_name,
+            clobbers,
+        )
+
+    def _make_verify_result(
+        self,
+        target: str,
+        signature: str,
+        binary_name: str,
+        addr: str,
+        checks: list[VerifyPortCheck],
+        warnings: list[str],
+        clobbers: dict | None = None,
+    ) -> "VerifyPortResult":
+        clobbers = clobbers or {}
+        saved = clobbers.get("saved", [])
+        c_vol = clobbers.get("clobbered_volatile", [])
+        c_nv = clobbers.get("clobbered_non_volatile", [])
+        if clobbers:
+            self._add_check(
+                checks,
+                "register_preservation",
+                f"non-volatile clobbers: {', '.join(c_nv) or 'none'}",
+                "hook must save/restore any non-volatile clobbers",
+                "warn" if c_nv else "pass",
+            )
+        else:
+            warnings = [
+                *warnings,
+                "Register-clobber analysis unavailable for this target; "
+                "save/restore registers conservatively in the hook stub.",
+            ]
+        verdict = "fail" if any(c.status == "fail" for c in checks) else "pass"
+        hint = (
+            "Fix the failing checks and re-run verify_port; "
+            "disassemble_call_site shows the raw stack evidence."
+            if verdict == "fail"
+            else None
+        )
+        return VerifyPortResult(
+            target=target,
+            proposed_signature=signature,
+            binary_name=binary_name,
+            addr=addr,
+            checks=checks,
+            verdict=verdict,
+            warnings=warnings,
+            hint=hint,
+            saved_registers=saved,
+            clobbered_volatile=c_vol,
+            clobbered_non_volatile=c_nv,
+        )
+
+    def _verify_port_at_call_site(
+        self,
+        func: "Function",
+        target: str,
+        signature: str,
+        call_site: str,
+        proposed_conv: str,
+        proposed_arg_count: int,
+        binary_name: str,
+        clobbers: dict | None = None,
+    ) -> "VerifyPortResult":
+        site_addr = str(self._parse_address(call_site))
+        sites = self.analyze_call_sites(
+            str(func.getEntryPoint()), binary_name=binary_name
+        ).call_sites
+        site = next((s for s in sites if s.address == site_addr), None)
+        if site is None:
+            raise ValueError(
+                f"No call instruction found at {site_addr} in function "
+                f"'{func.getName()}'."
+            )
+
+        checks: list[VerifyPortCheck] = []
+        expected_stack_args = max(
+            0, proposed_arg_count - self._reg_arg_count(proposed_conv)
+        )
+        self._add_check(
+            checks,
+            "stack_param_count",
+            f"{len(site.stack_args)} observed at call site",
+            f"{expected_stack_args} stack-passed in proposed signature",
+            "pass" if len(site.stack_args) == expected_stack_args else "fail",
+        )
+        if "thiscall" in self._norm_conv(proposed_conv):
+            self._add_check(
+                checks,
+                "this_pointer",
+                "ECX written before call (thiscall requires this in ECX)",
+                site.ecx_source or "no ECX write observed",
+                "pass" if site.ecx_source is not None else "fail",
+            )
+        if site.inferred_convention and "?" not in site.inferred_convention:
+            match = self._norm_conv(site.inferred_convention) == self._norm_conv(
+                proposed_conv
+            )
+            self._add_check(
+                checks,
+                "calling_convention",
+                site.inferred_convention,
+                proposed_conv or "unspecified",
+                "pass" if match else "fail",
+            )
+        return self._make_verify_result(
+            target, signature, binary_name, site_addr, checks, list(site.warnings),
+            clobbers,
+        )
+
+    def _verify_port_at_function(
+        self,
+        func: "Function",
+        target: str,
+        signature: str,
+        proposed_conv: str,
+        proposed_arg_lengths: list[int],
+        ptr: int,
+        binary_name: str,
+        clobbers: dict | None = None,
+    ) -> "VerifyPortResult":
+        checks: list[VerifyPortCheck] = []
+        warnings: list[str] = []
+        self._check_declared_convention(func, proposed_conv, checks, warnings)
+        self._check_declared_param_count(func, len(proposed_arg_lengths), checks)
+        self._check_ret_cleanup(
+            func, proposed_conv, proposed_arg_lengths, ptr, checks, warnings
+        )
+        return self._make_verify_result(
+            target, signature, binary_name, str(func.getEntryPoint()), checks,
+            warnings, clobbers,
+        )
+
+    def _check_declared_convention(
+        self,
+        func: "Function",
+        proposed_conv: str,
+        checks: list[VerifyPortCheck],
+        warnings: list[str],
+    ) -> None:
+        actual_conv = None
+        try:
+            actual_conv = func.getCallingConventionName()
+        except Exception:
+            actual_conv = None
+        if actual_conv and self._norm_conv(actual_conv) not in ("default", "unknown", ""):
+            match = self._norm_conv(actual_conv) == self._norm_conv(proposed_conv)
+            self._add_check(
+                checks,
+                "calling_convention",
+                actual_conv,
+                proposed_conv or "unspecified",
+                "pass" if match else "fail",
+            )
+            return
+        self._add_check(
+            checks,
+            "calling_convention",
+            "no convention declared in Ghidra",
+            proposed_conv or "unspecified",
+            "warn",
+        )
+        warnings.append(
+            "Binary has no declared calling convention for this function; "
+            "verify the convention by hand (disassemble_call_site)."
+        )
+
+    def _check_declared_param_count(
+        self,
+        func: "Function",
+        proposed_arg_count: int,
+        checks: list[VerifyPortCheck],
+    ) -> None:
+        try:
+            actual_param_count = int(func.getParameterCount())
+        except Exception:
+            return
+        self._add_check(
+            checks,
+            "param_count",
+            f"{actual_param_count} declared in Ghidra",
+            f"{proposed_arg_count} in proposed signature",
+            "pass" if actual_param_count == proposed_arg_count else "warn",
+        )
+
+    def _check_ret_cleanup(
+        self,
+        func: "Function",
+        proposed_conv: str,
+        proposed_arg_lengths: list[int],
+        ptr: int,
+        checks: list[VerifyPortCheck],
+        warnings: list[str],
+    ) -> None:
+        """Independent evidence: RET N epilogues (callee-cleaned stack bytes)."""
+        cleaned = self._ret_cleanup_bytes(func)
+        proposed_stack_bytes = self._expected_stack_param_bytes(
+            proposed_conv, proposed_arg_lengths, ptr
+        )
+        if cleaned is not None:
+            self._add_check(
+                checks,
+                "stack_param_bytes",
+                f"ret {cleaned} epilogue (callee cleans {cleaned} bytes)",
+                f"{proposed_stack_bytes} stack bytes implied by proposed signature",
+                "pass" if cleaned == proposed_stack_bytes else "fail",
+            )
+            return
+        self._add_check(
+            checks,
+            "stack_param_bytes",
+            "no ret N epilogue found (caller-cleanup or unknown)",
+            f"{proposed_stack_bytes} stack bytes implied by proposed signature",
+            "warn",
+        )
+        if "cdecl" not in self._norm_conv(proposed_conv) and proposed_stack_bytes > 0:
+            warnings.append(
+                "No ret N epilogue found, but the proposed convention is "
+                "callee-cleanup; double-check the epilogue manually."
+            )
+
+    def _ret_cleanup_bytes(self, func: "Function") -> int | None:
+        """Return N if every ``ret N`` in the body cleans the same N, else None.
+
+        A bare ``ret`` (no operand) cleans 0 bytes; a function with only bare
+        rets returns 0. Mixed or absent values return None (inconclusive).
+        """
+        listing = self.program.getListing()
+        values: set[int] = set()
+        saw_ret = False
+        for insn in listing.getInstructions(func.getBody(), True):
+            if not insn.getFlowType().isTerminal():
+                continue
+            mnemonic = str(insn.getMnemonicString()).lower()
+            if not mnemonic.startswith("ret"):
+                continue
+            saw_ret = True
+            if insn.getNumOperands() == 0:
+                values.add(0)
+                continue
+            rep = insn.getDefaultOperandRepresentation(0)
+            try:
+                values.add(int(str(rep), 0) if rep else 0)
+            except (TypeError, ValueError):
+                try:
+                    values.add(int(str(rep).rstrip("h"), 16))
+                except (TypeError, ValueError):
+                    return None
+        if not saw_ret or len(values) != 1:
+            return None
+        return values.pop()
 
     @handle_exceptions
     def gen_callgraph(

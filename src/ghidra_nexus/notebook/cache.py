@@ -20,12 +20,13 @@ and log a warning — never fail the tool call.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from typing import TYPE_CHECKING
 
 from ghidra_nexus.notebook.addresses import to_int, to_rva
 from ghidra_nexus.notebook.extractors import extract_for
-from ghidra_nexus.notebook.pagination import window_text
+from ghidra_nexus.notebook.pagination import window_list, window_text
 
 if TYPE_CHECKING:
     from ghidra_nexus.context import ProgramInfo as JvmProgramInfo
@@ -285,6 +286,93 @@ def write_disasm_cache(
             nb.embed_queue.enqueue(vid)
     except Exception:
         logger.warning("write_disasm_cache failed for %s/%s", binary_name, rva, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Call-sites cache
+# ---------------------------------------------------------------------------
+
+def check_callsite_cache(
+    nb: Notebook,
+    *,
+    binary_id: int,
+    rva: str,
+    current_gen: int,
+    offset: int,
+    limit: int,
+) -> dict | None:
+    cached = nb.call_sites.get(binary_id, rva)
+    if cached is None:
+        return None
+    stored_gen = cached.get("analysis_generation", 0)
+    if stored_gen < current_gen:
+        return None
+    try:
+        payload = json.loads(cached.get("payload_text") or "")
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    sites = payload.get("call_sites") or []
+    window = window_list(sites, offset=offset, limit=limit)
+    items = window.pop("items")
+    return {
+        "cached": True,
+        "function_name": payload.get("function_name") or "",
+        "function_address": payload.get("function_address") or "",
+        "call_sites": items,
+        "total_call_sites": window.get("total", 0),
+        "page": window,
+    }
+
+
+def write_callsite_cache(
+    nb: Notebook,
+    *,
+    binary_id: int,
+    binary_name: str,
+    rva: str,
+    current_gen: int,
+    result: dict,
+) -> None:
+    sites = result.get("call_sites") or []
+    payload = {
+        "function_name": result.get("function_name") or "",
+        "function_address": result.get("function_address") or "",
+        "call_sites": sites,
+        "total_call_sites": result.get("total_call_sites") or len(sites),
+    }
+    try:
+        row_id = nb.call_sites.put(
+            binary_id=binary_id,
+            rva=rva,
+            payload=json.dumps(payload, ensure_ascii=False, default=str),
+            site_count=payload["total_call_sites"],
+            analysis_generation=current_gen,
+        )
+        view = extract_for("call_sites", payload)
+        if view is not None:
+            vid = nb.views.upsert(
+                binary_id=binary_id,
+                rva=rva,
+                kind="call_sites",
+                source_table="call_sites",
+                source_row_id=row_id,
+                summary=view.summary,
+                key_entities=view.entities_json(),
+                view_model=view.view_model,
+                analysis_generation=current_gen,
+            )
+            nb.search.upsert(
+                kind="call_sites",
+                binary_id=binary_id,
+                rva=rva,
+                name=payload["function_name"],
+                body=view.search_blob(),
+            )
+            nb.embed_queue.enqueue(vid)
+    except Exception:
+        logger.warning("write_callsite_cache failed for %s/%s", binary_name, rva, exc_info=True)
 
 
 # ---------------------------------------------------------------------------

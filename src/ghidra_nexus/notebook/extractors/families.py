@@ -197,3 +197,49 @@ class SectionHealthExtractor:
 
 
 register(SectionHealthExtractor())
+
+
+# ---------------------------------------------------------------------------
+# Call-sites extractor — hook-porting evidence (conventions, warnings)
+# ---------------------------------------------------------------------------
+
+class CallSitesExtractor:
+    kind = "call_sites"
+
+    def extract(self, payload: dict[str, Any]) -> ExtractedView:
+        name: str = payload.get("function_name") or "<unknown>"
+        sites: list = payload.get("call_sites") or []
+        total = len(sites)
+        indirect = sum(1 for s in sites if s.get("is_indirect"))
+
+        entities: list[KeyEntity] = []
+        conventions: Counter = Counter()
+        warned = 0
+        for s in sites:
+            target = s.get("target_name")
+            if target and len(entities) < _MAX_ENTITIES_PER_KIND:
+                entities.append(KeyEntity(kind="callee", value=target))
+            conv = s.get("callee_convention") or s.get("inferred_convention")
+            if conv:
+                conventions[conv] += 1
+            if s.get("warnings"):
+                warned += 1
+
+        conv_str = ", ".join(f"{c}x{n}" for c, n in conventions.most_common(6))
+        parts = [
+            f"Call-site analysis of {name}: {total} call site(s), {indirect} indirect."
+        ]
+        if conv_str:
+            parts.append(f"Conventions: {conv_str}.")
+        if warned:
+            parts.append(f"{warned} site(s) carry verification warnings.")
+
+        return ExtractedView(
+            summary=" ".join(parts),
+            key_entities=entities,
+            view_model="extractive_v1",
+            quality_hint="ok" if total > 0 else "empty",
+        )
+
+
+register(CallSitesExtractor())

@@ -38,6 +38,7 @@ def _ensure_extractor_families():
     from ghidra_nexus.notebook.extractors.base import register
     from ghidra_nexus.notebook.extractors.decompile import DecompileExtractor
     from ghidra_nexus.notebook.extractors.families import (
+        CallSitesExtractor,
         DisasmExtractor,
         SectionHealthExtractor,
         StringsExtractor,
@@ -49,6 +50,7 @@ def _ensure_extractor_families():
     register(XrefsExtractor())
     register(StringsExtractor())
     register(SectionHealthExtractor())
+    register(CallSitesExtractor())
     # This fixture never tears down — we want families permanent.
 
 

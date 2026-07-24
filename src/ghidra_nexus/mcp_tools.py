@@ -18,6 +18,7 @@ Phase 2 cache contract:
 
 import asyncio
 import functools
+import hashlib
 import logging
 import sqlite3
 import threading
@@ -47,6 +48,8 @@ from ghidra_nexus.models import (
     CallGraphDirection,
     CallGraphDisplayType,
     CallGraphResult,
+    CallSiteAnalysisResult,
+    CallSiteInfo,
     CodeSearchResult,
     CodeSearchResults,
     CommentResponse,
@@ -72,21 +75,24 @@ from ghidra_nexus.models import (
     SymbolSearchResults,
     VariableRenameResponse,
     VariableTypeResponse,
+    VerifyPortResult,
 )
 from ghidra_nexus.notebook.cache import (
     _resolve_rva,
+    check_callsite_cache,
     check_decompile_cache,
     check_disasm_cache,
     check_strings_cache,
     check_xrefs_cache,
     record_breadcrumb,
     resolve_binary_id,
+    write_callsite_cache,
     write_decompile_cache,
     write_disasm_cache,
     write_strings_cache,
     write_xrefs_cache,
 )
-from ghidra_nexus.notebook.pagination import clamp_limit
+from ghidra_nexus.notebook.pagination import clamp_limit, window_list
 from ghidra_nexus.notebook.store import Notebook
 from ghidra_nexus.tools import GhidraTools
 from ghidra_nexus.watchdog import get_watchdog
@@ -1237,6 +1243,164 @@ async def disassemble(
 
 
 @mcp_error_handler
+async def disassemble_call_site(
+    binary_name: str,
+    ctx: Context,
+    function: str,
+    offset: int = 0,
+    limit: int = 0,
+    max_scan: int = 40,
+) -> CallSiteAnalysisResult:
+    """Reconstruct stack-argument evidence for every CALL in a function.
+
+    For each call site (direct or indirect), walks backwards from the CALL
+    collecting PUSH / MOV [sp+X] writes with call-time stack offsets,
+    resolves one level of register indirection (e.g. ``push edx`` after
+    ``lea edx, [esp+14h]`` → ``&[sp+0xNN]``), reports ECX ``this`` evidence
+    and post-call stack cleanup, and infers the calling convention with an
+    explicit confidence level. Use this before porting any call to another
+    language — decompiler pseudocode can hide a non-standard push order.
+    """
+    if max_scan <= 0 or max_scan > 500:
+        raise _ToolRecoverable(
+            ToolErrorCode.INVALID_RANGE,
+            "max_scan must be in 1..500",
+            binary_name=binary_name,
+            addr=function,
+        )
+    limit = clamp_limit("call_sites", limit if limit > 0 else None)
+
+    pyghidra_context, program_info = _require_program(ctx, binary_name, require_analysis=True)
+    nb = await _get_notebook(pyghidra_context)
+    sha256, image_base, _gen = _get_binary_meta(pyghidra_context, binary_name, program_info)
+    bid = resolve_binary_id(nb, binary_name, sha256, image_base=image_base)
+    rva = _resolve_rva(function, program_info)
+
+    cached = check_callsite_cache(
+        nb, binary_id=bid, rva=rva, current_gen=0, offset=offset, limit=limit
+    )
+    if cached is not None:
+        return CallSiteAnalysisResult(binary_name=binary_name, **cached)
+
+    tools = GhidraTools(program_info)
+
+    def _run():
+        return tools.analyze_call_sites(function, max_scan=max_scan, binary_name=binary_name)
+
+    result = await get_executor().submit(
+        program_info, _run, task_id=f"disassemble_call_site:{binary_name}:{function}"
+    )
+
+    site_dicts = [s.model_dump() for s in result.call_sites]
+    write_callsite_cache(
+        nb,
+        binary_id=bid,
+        binary_name=binary_name,
+        rva=rva,
+        current_gen=0,
+        result={
+            "function_name": result.function_name,
+            "function_address": result.function_address,
+            "call_sites": site_dicts,
+            "total_call_sites": result.total_call_sites,
+        },
+    )
+
+    window = window_list(site_dicts, offset=offset, limit=limit)
+    items = window.pop("items")
+    return CallSiteAnalysisResult(
+        function_name=result.function_name,
+        function_address=result.function_address,
+        binary_name=binary_name,
+        call_sites=[CallSiteInfo(**d) for d in items],
+        total_call_sites=result.total_call_sites,
+        page=window,
+    )
+
+
+@mcp_error_handler
+async def verify_port(
+    binary_name: str,
+    ctx: Context,
+    target: str,
+    signature: str,
+    call_site: str | None = None,
+) -> VerifyPortResult:
+    """Pre-flight check of a proposed ported signature against binary evidence.
+
+    ``target`` is a function name or address; ``signature`` is the C-style
+    prototype you intend to port to (e.g.
+    ``"int __thiscall Lock(int flags, uint count, void **out, int arg2)"``).
+    Compares calling convention, parameter count, and stack-parameter bytes
+    (from ``ret N`` epilogues, or from call-site push evidence when
+    ``call_site`` is given) and returns pass/fail per check. Read-only —
+    parses but never applies the signature. Run this BEFORE writing hook
+    bytes; it catches argument-order and cleanup-convention mismatches.
+    """
+    if not signature or not signature.strip():
+        raise _ToolRecoverable(
+            ToolErrorCode.INVALID_PARAMS,
+            "signature must be a non-empty C-style prototype, "
+            "e.g. 'int __thiscall Lock(int flags, uint count)'",
+            binary_name=binary_name,
+            addr=target,
+        )
+    pyghidra_context, program_info = _require_program(ctx, binary_name, require_analysis=True)
+
+    tools = GhidraTools(program_info)
+
+    def _run():
+        return tools.verify_port(
+            target, signature, call_site=call_site, binary_name=binary_name
+        )
+
+    result = await get_executor().submit(
+        program_info, _run, task_id=f"verify_port:{binary_name}:{target}"
+    )
+
+    # Knowledge plane: record the verdict and surface any prior one
+    # (state-drift rule — return the diff, not just the latest answer).
+    try:
+        nb = await _get_notebook(pyghidra_context)
+        sha256, image_base, _gen = _get_binary_meta(pyghidra_context, binary_name, program_info)
+        bid = resolve_binary_id(nb, binary_name, sha256, image_base=image_base)
+        rva = _resolve_rva(result.addr or target, program_info)
+
+        prior_row = nb.port_verifications.latest_for(bid, rva)
+        if prior_row is not None:
+            result.prior_verdict = {
+                "verdict": prior_row.get("verdict"),
+                "signature": prior_row.get("signature"),
+                "created_at": str(prior_row.get("created_at")),
+            }
+            prior_sig = prior_row.get("signature")
+            if isinstance(prior_sig, str) and prior_sig and prior_sig != signature:
+                result.warnings.append(
+                    f"prior verification used a different signature: {prior_sig}"
+                )
+
+        nb.port_verifications.put(
+            binary_id=bid,
+            rva=rva,
+            signature=signature,
+            signature_hash=_signature_hash(signature),
+            verdict=result.verdict,
+            checks=[c.model_dump() for c in result.checks],
+            warnings=result.warnings,
+            call_site_rva=_resolve_rva(call_site, program_info) if call_site else None,
+        )
+    except Exception:
+        logger.warning("verify_port: failed to record verdict", exc_info=True)
+
+    return result
+
+
+def _signature_hash(signature: str) -> str:
+    normalized = " ".join(signature.split()).lower()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+@mcp_error_handler
 async def gen_callgraph(
     binary_name: str,
     function_name: str,
@@ -2057,9 +2221,10 @@ async def notebook_vacuum(
 ) -> dict:
     """Reclaim notebook space by deleting stale cache generations.
 
-    Keeps the newest ``keep_generations`` of decompiles and disassemblies per
-    binary. Set ``run_vacuum=True`` to run SQLite ``VACUUM`` afterward, which
-    rewires the DB file and requires temporary disk space (~2x the file size).
+    Keeps the newest ``keep_generations`` of decompiles, disassemblies, and
+    call-site analyses per binary. Set ``run_vacuum=True`` to run SQLite
+    ``VACUUM`` afterward, which rewires the DB file and requires temporary
+    disk space (~2x the file size).
     """
     pyghidra_context = _get_context(ctx)
     nb = await _get_notebook(pyghidra_context)
@@ -2085,9 +2250,11 @@ async def notebook_vacuum(
 
     total_decompiles = 0
     total_disassemblies = 0
+    total_call_sites = 0
     for bid, _name in targets:
         total_decompiles += nb.decompiles.delete_old_generations(bid, keep_generations)
         total_disassemblies += nb.disassemblies.delete_old_generations(bid, keep_generations)
+        total_call_sites += nb.call_sites.delete_old_generations(bid, keep_generations)
 
     freed_note = "VACUUM not run; set run_vacuum=True to reclaim file space."
     if run_vacuum:
@@ -2101,6 +2268,7 @@ async def notebook_vacuum(
         "binaries_affected": [name for _, name in targets],
         "decompiles_deleted": total_decompiles,
         "disassemblies_deleted": total_disassemblies,
+        "call_sites_deleted": total_call_sites,
         "keep_generations": keep_generations,
         "vacuum_note": freed_note,
     }
@@ -2117,6 +2285,20 @@ async def save(ctx: Context) -> SaveRequestResult:
 
 _AWAKE = False
 _AWAKE_LOCK = threading.Lock()
+
+
+def _register_lazy_tools(mcp_server):
+    """Register only the wake/status tools (streamable-http daemon cold start).
+
+    The daemon starts without the JVM; the agent calls ``wake_ghidra`` to boot
+    Ghidra, which then registers the full analysis surface via
+    :func:`_register_all_on_demand`.
+    """
+    for fn, name in ((wake_ghidra, "wake_ghidra"), (ghidra_status, "ghidra_status")):
+        try:
+            mcp_server.add_tool(fn, name=name)
+        except Exception:
+            logger.warning("Failed to register tool %s", name, exc_info=True)
 
 
 def _register_all_on_demand(mcp_server):
@@ -2139,6 +2321,8 @@ def _register_all_on_demand(mcp_server):
         (search_strings, "search_strings"),
         (read_bytes, "read_bytes"),
         (disassemble, "disassemble"),
+        (disassemble_call_site, "disassemble_call_site"),
+        (verify_port, "verify_port"),
         (gen_callgraph, "gen_callgraph"),
         (section_health, "section_health"),
         (analysis_status, "analysis_status"),

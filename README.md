@@ -75,6 +75,7 @@ uv run ghidra-nexus
 | **Lifecycle** | `import_binary`, `delete_project_binary`, `analysis_status`, `save` |
 | **Triage** | `survey_binary_fast` / `survey_binary_full`, `section_health` |
 | **Read** | `decompile_function`, `disassemble`, `list_imports`, `list_exports`, `search_strings`, `list_xrefs`, `gen_callgraph`, `read_bytes` |
+| **Hook porting** | `disassemble_call_site` (per-CALL push/stack-offset evidence + convention confidence + P-code cross-check), `verify_port` (pre-flight signature check with register-clobber analysis; verdicts are remembered and prior ones surface on re-runs) |
 | **Search** | `search_symbols_by_name`, `search_code` (sqlite-vec hybrid; ChromaDB optional) |
 | **Write** | `rename_function`, `rename_variable`, `set_variable_type`, `set_function_prototype`, `set_comment` |
 | **Notebook** | `notebook_summary`, `notebook_search`, `notebook_breadcrumbs`, `notebook_alias`, `notebook_hypothesis`, `notebook_embed_status`, `notebook_rebuild_embeddings`, `notebook_archive_breadcrumbs`, `notebook_vacuum` |

@@ -9,7 +9,7 @@ import pytest
 
 from ghidra_nexus.notebook import Notebook
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 
 @pytest.fixture
@@ -37,6 +37,7 @@ class TestMigrations:
     def test_all_tables_exist(self, nb):
         tables = {
             "binaries", "functions", "decompiles", "disassemblies",
+            "call_sites", "port_verifications",
             "xrefs", "strings", "breadcrumbs", "breadcrumbs_archive",
             "aliases", "hypotheses", "artifact_views", "embeddings",
             "embed_queue", "fts",  # virtual table

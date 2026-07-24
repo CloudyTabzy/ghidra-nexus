@@ -473,6 +473,139 @@ class DisassembleResult(BaseModel):
     cached: bool = Field(False, description="True when served from the notebook cache.")
 
 
+class StackArgEvidence(BaseModel):
+    """One observed stack write feeding a call site."""
+
+    slot_offset: int = Field(
+        ...,
+        description=(
+            "Byte offset in the call-time SP frame. The first stack argument "
+            "(what the callee reads as [esp+4] on x86-32) has slot_offset 0."
+        ),
+    )
+    source: str = Field(..., description="Raw source operand text (e.g. 'eax', '0x1').")
+    resolved_source: str | None = Field(
+        None,
+        description=(
+            "One-level register resolution normalized to the call-time frame "
+            "(e.g. '&[sp+0x20]' for a lea). None when unresolvable."
+        ),
+    )
+    written_at: str = Field(..., description="Address of the PUSH/MOV instruction.")
+    write_kind: str = Field(..., description="'push' or 'mov'.")
+
+
+class CallSiteInfo(BaseModel):
+    """Reconstructed calling-convention evidence for one CALL instruction."""
+
+    address: str
+    instruction: str = Field(..., description="Mnemonic + operands, e.g. 'CALL EAX'.")
+    is_indirect: bool
+    target_name: str | None = Field(None, description="Resolved callee name (direct calls).")
+    target_address: str | None = Field(None, description="Resolved callee address (direct calls).")
+    callee_convention: str | None = Field(
+        None, description="Calling convention declared on the callee in Ghidra, if known."
+    )
+    callee_param_count: int | None = None
+    stack_args: list[StackArgEvidence] = Field(
+        default_factory=list,
+        description="Observed argument writes, ascending slot order (arg1 first).",
+    )
+    other_stack_writes: list[StackArgEvidence] = Field(
+        default_factory=list,
+        description="Stack writes outside the contiguous argument region (locals/spills).",
+    )
+    register_args: dict[str, str] = Field(
+        default_factory=dict,
+        description="x64 only: last write to each argument register (rcx/rdx/r8/r9).",
+    )
+    ecx_source: str | None = Field(
+        None,
+        description="x86-32: nearest write to ECX before the call (this-pointer evidence).",
+    )
+    caller_cleanup_bytes: int | None = Field(
+        None,
+        description="Bytes the caller removes from the stack after the call (cdecl evidence).",
+    )
+    pcode_arg_count: int | None = Field(
+        None,
+        description=(
+            "Argument count the decompiler assumes at this call (P-code cross-check, "
+            "populated only when listing evidence was thin). A mismatch with "
+            "stack_args is itself a warning signal — never an override."
+        ),
+    )
+    inferred_convention: str | None = Field(
+        None,
+        description=(
+            "Best convention guess. A '?' suffix means inferred from push/cleanup "
+            "evidence, not declared. Trust it only with confidence='high'."
+        ),
+    )
+    confidence: str = Field(..., description="'high', 'medium', or 'low'.")
+    warnings: list[str] = Field(default_factory=list)
+
+
+class CallSiteAnalysisResult(BaseModel):
+    """All call sites of one function with stack-argument evidence."""
+
+    function_name: str
+    function_address: str
+    binary_name: str = ""
+    call_sites: list[CallSiteInfo]
+    total_call_sites: int
+    cached: bool = Field(False, description="True when served from the notebook cache.")
+    page: dict | None = Field(
+        None,
+        description="Pagination envelope (offset, limit, total, has_more, next_offset).",
+    )
+
+
+class VerifyPortCheck(BaseModel):
+    """One comparison between a proposed signature and binary evidence."""
+
+    name: str = Field(..., description="e.g. 'calling_convention', 'stack_param_bytes'.")
+    expected: str = Field(..., description="What the binary evidence shows.")
+    actual: str = Field(..., description="What the proposed signature says.")
+    status: str = Field(..., description="'pass', 'fail', or 'warn'.")
+
+
+class VerifyPortResult(BaseModel):
+    """Pre-flight check of a proposed ported signature against binary evidence."""
+
+    target: str
+    proposed_signature: str
+    binary_name: str = ""
+    addr: str = ""
+    checks: list[VerifyPortCheck]
+    verdict: str = Field(..., description="'pass' or 'fail' (any failed check fails the verdict).")
+    warnings: list[str] = Field(default_factory=list)
+    hint: str | None = Field(None, description="One-sentence next step when verdict is 'fail'.")
+    saved_registers: list[str] = Field(
+        default_factory=list,
+        description="Registers the function writes but restores (safe for hooks).",
+    )
+    clobbered_volatile: list[str] = Field(
+        default_factory=list,
+        description="Registers clobbered that the ABI already treats as volatile.",
+    )
+    clobbered_non_volatile: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Registers clobbered that the ABI says must be preserved — a hook "
+            "MUST save/restore these. Empty means no ABI hazard found."
+        ),
+    )
+    prior_verdict: dict | None = Field(
+        None,
+        description=(
+            "Latest previously recorded verification for this target "
+            "(verdict, signature, created_at). A signature mismatch vs the "
+            "current run is called out in warnings."
+        ),
+    )
+
+
 class CallGraphDirection(str, Enum):
     """Represents the direction of the call graph."""
 
