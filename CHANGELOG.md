@@ -2,6 +2,44 @@
 
 All notable changes to **GhidraNexus** are documented in this file.
 
+## [0.4.0] — Hook-porting fidelity
+
+### Added
+- **`disassemble_call_site`** — per-CALL stack evidence for hook porting:
+  push/`MOV [sp+X]` writes with call-time stack offsets, one-level register
+  resolution, ECX `this` evidence, caller-cleanup bytes, calling-convention
+  inference with explicit confidence, and a P-code cross-check fallback when
+  listing evidence is thin. Catches non-standard push orders that decompiler
+  pseudocode hides.
+- **`verify_port`** — pre-flight check of a proposed ported signature against
+  `ret N` epilogues and call-site push evidence, with register-clobber
+  analysis (`saved_registers` / `clobbered_volatile` /
+  `clobbered_non_volatile`).
+- **Verdict memory** — `verify_port` results persist in the new
+  `port_verifications` table (schema v4, migration
+  `004_port_verifications.sql`); re-runs surface `prior_verdict` and warn on
+  signature drift.
+- **Knowledge-plane FTS coverage** — hypotheses, aliases, and failure
+  breadcrumbs (`error_code` only) are now indexed, so `notebook_search`
+  recalls prior findings. Plain breadcrumbs are deliberately not indexed to
+  keep FTS signal clean.
+- Schema migration `003_call_sites.sql` — gzipped per-function call-site
+  analysis cache with extractor → view → FTS → embed pipeline.
+
+### Fixed
+- **streamable-http daemon startup crash**: `server.py` called an undefined
+  `_register_lazy_tools` (NameError on cold start). The lazy path now
+  registers `wake_ghidra` + `ghidra_status` as intended.
+- Latent `sqlite3` NameError in the breadcrumb archive fallback path
+  (`sqlite3` was TYPE_CHECKING-only but used at runtime).
+
+### Tests
+- 31 new unit tests in round 1 (`test_callsite_analysis.py`,
+  `test_callsite_cache.py`, `test_disassemble_call_site.py`,
+  `test_verify_port.py`) and 20 more in round 2 (register classification,
+  P-code fallback predicate, port-verification persistence, FTS recall).
+- Suite total: 502 passed, 1 skipped.
+
 ## [0.3.0] — Phase 5 (Polish)
 
 ### Added
